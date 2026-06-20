@@ -176,9 +176,7 @@ def _canonical_to_openai_messages(
                             },
                         }
                     )
-                # `thinking` blocks are dropped from the wire payload — most
-                # OpenAI-compatible providers reject them. They live only in
-                # AgentMessage.content + AgentMessage.thinking.
+                # `thinking` blocks are dropped from the wire payload.
             entry: dict[str, Any] = {
                 "role": "assistant",
                 "content": "\n".join(text_parts) if text_parts else None,
@@ -187,7 +185,6 @@ def _canonical_to_openai_messages(
                 entry["tool_calls"] = tool_calls
             result.append(entry)
         elif role == "system":
-            # rarely used; prepend after primary system message if both exist
             text = ""
             if isinstance(content, list):
                 text = "\n".join(
@@ -198,6 +195,165 @@ def _canonical_to_openai_messages(
             if text:
                 result.append({"role": "system", "content": text})
     return result
+
+
+# --- Responses API (OpenAI) — used when an agent enables built-in tools ------
+# The Responses API runs built-in tools (web_search, …) server-side within one
+# request, while still letting the model call our own function tools. Its wire
+# shape differs from chat-completions: `instructions` (system), `input` (a list of
+# message + function_call/function_call_output items), flattened function tools,
+# and an `output` list of typed items. We translate to/from the same canonical
+# blocks the rest of the engine uses, so AgentRunner is unchanged.
+
+
+def _tools_to_responses(
+    tools: list[ToolDefinition], builtin_tools: list[str] | None
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = [{"type": name} for name in (builtin_tools or [])]
+    for tool in tools:
+        out.append(
+            {
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.input_schema or {"type": "object", "properties": {}},
+            }
+        )
+    return out
+
+
+def _canonical_to_responses_input(
+    messages: list[dict[str, Any]],
+    image_urls: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Canonical history → Responses ``input`` items. tool_use/tool_result become
+    top-level ``function_call`` / ``function_call_output`` items (the API tolerates
+    a historical call for a tool not in the current set, so no special-casing)."""
+    items: list[dict[str, Any]] = []
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content", []) or []
+        if role == "user":
+            for b in content:
+                if b.get("type") == "tool_result":
+                    payload = b.get("content")
+                    if not isinstance(payload, str):
+                        payload = json.dumps(payload, default=str)
+                    items.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": b.get("tool_use_id"),
+                            "output": payload,
+                        }
+                    )
+            parts: list[dict[str, Any]] = []
+            for b in content:
+                if b.get("type") == "text" and b.get("text"):
+                    parts.append({"type": "input_text", "text": b["text"]})
+                elif b.get("type") == "image":
+                    url = (image_urls or {}).get(str(b.get("media_id")))
+                    if url:
+                        parts.append({"type": "input_image", "image_url": url})
+                    else:
+                        parts.append(
+                            {
+                                "type": "input_text",
+                                "text": f"[image attached: media_id={b.get('media_id')}]",
+                            }
+                        )
+            if parts:
+                items.append({"role": "user", "content": parts})
+        elif role == "assistant":
+            text_parts = [
+                b.get("text", "")
+                for b in content
+                if b.get("type") == "text" and b.get("text")
+            ]
+            if text_parts:
+                items.append({"role": "assistant", "content": "\n".join(text_parts)})
+            for b in content:
+                if b.get("type") == "tool_use":
+                    items.append(
+                        {
+                            "type": "function_call",
+                            "call_id": b.get("id"),
+                            "name": b.get("name"),
+                            "arguments": json.dumps(b.get("input", {}), default=str),
+                        }
+                    )
+        elif role == "system":
+            text = content if isinstance(content, str) else "\n".join(
+                b.get("text", "") for b in content if b.get("type") == "text"
+            )
+            if text:
+                items.append({"role": "user", "content": text})
+    return items
+
+
+def _responses_output_to_blocks(
+    response: Any,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Responses ``output`` items → canonical blocks (+ extracted thinking text).
+    ``web_search_call`` and other server-side tool items are dropped — their
+    results are already folded into the model's message (with url citations)."""
+    blocks: list[dict[str, Any]] = []
+    thinking_text: str | None = None
+    for item in getattr(response, "output", None) or []:
+        itype = getattr(item, "type", None)
+        if itype == "reasoning":
+            summary = getattr(item, "summary", None) or []
+            text = " ".join(getattr(s, "text", "") for s in summary).strip()
+            if text:
+                thinking_text = text
+                blocks.append({"type": "thinking", "thinking": text})
+        elif itype == "message":
+            parts = getattr(item, "content", None) or []
+            text = "".join(
+                getattr(p, "text", "")
+                for p in parts
+                if getattr(p, "type", "") == "output_text"
+            )
+            urls: list[str] = []
+            for p in parts:
+                for ann in getattr(p, "annotations", None) or []:
+                    if getattr(ann, "type", "") == "url_citation":
+                        url = getattr(ann, "url", None)
+                        if url and url not in urls:
+                            urls.append(url)
+            if text:
+                if urls:
+                    text = f"{text}\n\nSources: " + ", ".join(urls)
+                blocks.append({"type": "text", "text": text})
+        elif itype == "function_call":
+            raw = getattr(item, "arguments", "") or "{}"
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                parsed = {"_raw": raw}
+            blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": getattr(item, "call_id", None) or getattr(item, "id", None),
+                    "name": getattr(item, "name", ""),
+                    "input": parsed,
+                }
+            )
+    return blocks, thinking_text
+
+
+class _ResponsesUsage:
+    """Adapt Responses usage (input/output_tokens) to the chat-shaped fields
+    ``record_usage`` reads (prompt/completion_tokens + cached details)."""
+
+    def __init__(self, usage: Any) -> None:
+        self.prompt_tokens = getattr(usage, "input_tokens", 0)
+        self.completion_tokens = getattr(usage, "output_tokens", 0)
+        self.total_tokens = getattr(usage, "total_tokens", 0)
+        details = getattr(usage, "input_tokens_details", None)
+        cached = getattr(details, "cached_tokens", None) if details else None
+        self.prompt_tokens_details = type(
+            "_D", (), {"cached_tokens": cached}
+        )()
 
 
 class _StreamAccumulator:
@@ -332,7 +488,24 @@ class GenericProvider:
         redis: Redis,
         make_io: IOFactory | None = None,
         image_resolver: ImageResolver | None = None,
+        builtin_tools: list[str] | None = None,
     ) -> list[dict[str, Any]]:
+        # Agents with built-in tools (e.g. web_search) run on the Responses API,
+        # which executes those tools server-side while still calling our function
+        # tools. Same canonical blocks out, so AgentRunner is unchanged.
+        if builtin_tools:
+            return await self._complete_via_responses(
+                messages=messages,
+                system=system,
+                tools=tools,
+                model=model,
+                run_id=run_id,
+                node_id=node_id,
+                redis=redis,
+                make_io=make_io,
+                image_resolver=image_resolver,
+                builtin_tools=builtin_tools,
+            )
         accumulator = _StreamAccumulator()
         a_key = abort_key(run_id)
 
@@ -558,6 +731,262 @@ class GenericProvider:
             s_key, delta_seq_redis_key, inflight_meta_key(run_id, message_id)
         )
         return blocks
+
+    # -------------------------------------------------------------- responses
+    async def _complete_via_responses(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        system: str,
+        tools: list[ToolDefinition],
+        model: str | None,
+        run_id: uuid.UUID,
+        node_id: str,
+        redis: Redis,
+        make_io: IOFactory | None,
+        image_resolver: ImageResolver | None,
+        builtin_tools: list[str],
+    ) -> list[dict[str, Any]]:
+        """One streaming turn via the OpenAI Responses API. Built-in tools (e.g.
+        web_search) run server-side; our function tools come back as ``tool_use``
+        blocks the AgentRunner executes and re-sends. Streams text/thinking deltas
+        on the same channel + event ids as the chat-completions path, then persists
+        the final turn (built from the authoritative ``response.completed`` output,
+        so url citations and function calls are exact) + usage."""
+        a_key = abort_key(run_id)
+        build_io = make_io or (
+            lambda session: EventEmitter(session, redis, run_id)
+        )
+        message_id = uuid.uuid4()
+        s_key = stream_key(run_id, message_id)
+        delta_seq_redis_key = f"delta_seq:{run_id}:{message_id}"
+        text_parts: list[str] = []
+        thinking_parts: list[str] = []
+        text_chunk_index = 0
+        thinking_chunk_index = 0
+        final_response: Any = None
+
+        image_urls = await self._resolve_image_urls(messages, image_resolver)
+        request: dict[str, Any] = {
+            "model": model or self._default_model,
+            "input": _canonical_to_responses_input(messages, image_urls or None),
+            "tools": _tools_to_responses(tools, builtin_tools),
+            "stream": True,
+        }
+        if system:
+            request["instructions"] = system
+        if request["tools"]:
+            request["tool_choice"] = "auto"
+
+        try:
+            stream = await self._chat_client.responses.create(**request)
+        except RateLimitError as exc:
+            raise LLMRateLimitError(str(exc)) from exc
+
+        # Emit the lifecycle start up front so deltas sort right after it; the
+        # turn always yields text or a tool call.
+        started_seq = await self._emit(
+            build_io,
+            run_id,
+            RunEventType.agent_message_started,
+            node_id,
+            {"message_id": str(message_id), "role": AgentMessageRole.assistant.value},
+        )
+        delta_seq_base = started_seq or 0
+        await self._write_inflight_meta(redis, run_id, node_id, message_id, delta_seq_base)
+
+        try:
+            async for ev in stream:
+                if await redis.exists(a_key):
+                    await self._save_partial_blocks(
+                        text_parts, thinking_parts, run_id, node_id, redis,
+                        message_id, build_io,
+                    )
+                    raise AbortSignalError(run_id, node_id)
+                etype = getattr(ev, "type", "")
+                if etype == "response.completed":
+                    final_response = ev.response
+                elif etype == "response.output_text.delta":
+                    delta = getattr(ev, "delta", "") or ""
+                    if not delta:
+                        continue
+                    text_parts.append(delta)
+                    await self._push_stream(redis, s_key, "text", delta)
+                    seq = await self._next_delta_sequence(
+                        redis, delta_seq_redis_key, delta_seq_base
+                    )
+                    await publish_run_event(
+                        redis, run_id, RunEventType.agent_text_delta, node_id,
+                        {
+                            "message_id": str(message_id),
+                            "chunk_index": text_chunk_index,
+                            "text": delta,
+                        },
+                        seq,
+                        event_id=delta_event_id(message_id, "text", text_chunk_index),
+                    )
+                    text_chunk_index += 1
+                elif etype == "response.reasoning_summary_text.delta":
+                    delta = getattr(ev, "delta", "") or ""
+                    if not delta:
+                        continue
+                    thinking_parts.append(delta)
+                    await self._push_stream(redis, s_key, "thinking", delta)
+                    seq = await self._next_delta_sequence(
+                        redis, delta_seq_redis_key, delta_seq_base
+                    )
+                    await publish_run_event(
+                        redis, run_id, RunEventType.agent_thinking_delta, node_id,
+                        {
+                            "message_id": str(message_id),
+                            "chunk_index": thinking_chunk_index,
+                            "text": delta,
+                        },
+                        seq,
+                        event_id=delta_event_id(
+                            message_id, "thinking", thinking_chunk_index
+                        ),
+                    )
+                    thinking_chunk_index += 1
+                elif etype.startswith("response.web_search_call."):
+                    # Live "searching the web…" signal (in_progress/searching/
+                    # completed). Pub/sub-only, sequenced like the deltas.
+                    seq = await self._next_delta_sequence(
+                        redis, delta_seq_redis_key, delta_seq_base
+                    )
+                    await publish_run_event(
+                        redis, run_id, RunEventType.builtin_tool_call, node_id,
+                        {
+                            "message_id": str(message_id),
+                            "tool": "web_search",
+                            "status": etype.rsplit(".", 1)[-1],
+                        },
+                        seq,
+                    )
+                elif etype == "response.output_item.done":
+                    item = getattr(ev, "item", None)
+                    if getattr(item, "type", "") == "web_search_call":
+                        action = getattr(item, "action", None)
+                        seq = await self._next_delta_sequence(
+                            redis, delta_seq_redis_key, delta_seq_base
+                        )
+                        await publish_run_event(
+                            redis, run_id, RunEventType.builtin_tool_call, node_id,
+                            {
+                                "message_id": str(message_id),
+                                "tool": "web_search",
+                                "status": "result",
+                                # The main query + every query the model actually ran.
+                                "query": getattr(action, "query", None),
+                                "queries": list(getattr(action, "queries", None) or []),
+                            },
+                            seq,
+                        )
+        except AbortSignalError:
+            raise
+        except RateLimitError as exc:
+            await self._save_partial_blocks(
+                text_parts, thinking_parts, run_id, node_id, redis, message_id, build_io
+            )
+            raise LLMRateLimitError(str(exc)) from exc
+        except Exception:
+            await self._save_partial_blocks(
+                text_parts, thinking_parts, run_id, node_id, redis, message_id, build_io
+            )
+            raise
+
+        # Final blocks from the authoritative completed response (exact citations
+        # + function calls); fall back to streamed text if it's somehow absent.
+        if final_response is not None:
+            blocks, thinking = _responses_output_to_blocks(final_response)
+        else:
+            blocks = []
+            joined_thinking = "".join(thinking_parts).strip() or None
+            if joined_thinking:
+                blocks.append({"type": "thinking", "thinking": joined_thinking})
+            joined_text = "".join(text_parts)
+            if joined_text:
+                blocks.append({"type": "text", "text": joined_text})
+            thinking = joined_thinking
+
+        async with self._session_factory() as db:
+            emitter = build_io(db)
+            await emitter.save_message(
+                node_id=node_id,
+                role=AgentMessageRole.assistant,
+                content=blocks,
+                is_partial=False,
+                thinking=thinking,
+                message_id=message_id,
+            )
+            await emitter.emit(
+                RunEventType.agent_message_completed,
+                node_id=node_id,
+                payload={
+                    "message_id": str(message_id),
+                    "text_chunks": text_chunk_index,
+                    "thinking_chunks": thinking_chunk_index,
+                },
+            )
+            usage = getattr(final_response, "usage", None)
+            if usage is not None:
+                await record_usage(
+                    db,
+                    scope_id=run_id,
+                    message_id=message_id,
+                    model=request["model"],
+                    usage=_ResponsesUsage(usage),
+                )
+            await db.commit()
+        await redis.delete(
+            s_key, delta_seq_redis_key, inflight_meta_key(run_id, message_id)
+        )
+        return blocks
+
+    async def _save_partial_blocks(
+        self,
+        text_parts: list[str],
+        thinking_parts: list[str],
+        run_id: uuid.UUID,
+        node_id: str,
+        redis: Redis,
+        message_id: uuid.UUID,
+        build_io: IOFactory,
+    ) -> None:
+        """Persist whatever streamed before an abort/error as a partial turn
+        (mirrors the chat-completions ``_save_partial``)."""
+        s_key = stream_key(run_id, message_id)
+        d_key = f"delta_seq:{run_id}:{message_id}"
+        m_key = inflight_meta_key(run_id, message_id)
+        thinking = "".join(thinking_parts).strip() or None
+        blocks: list[dict[str, Any]] = []
+        if thinking:
+            blocks.append({"type": "thinking", "thinking": thinking})
+        text = "".join(text_parts)
+        if text:
+            blocks.append({"type": "text", "text": text})
+        if not blocks:
+            await redis.delete(s_key, d_key, m_key)
+            return
+        try:
+            async with self._session_factory() as db:
+                emitter = build_io(db)
+                await emitter.save_message(
+                    node_id=node_id,
+                    role=AgentMessageRole.assistant,
+                    content=blocks,
+                    is_partial=True,
+                    thinking=thinking,
+                    message_id=message_id,
+                )
+                await db.commit()
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "failed to persist partial Responses turn for run %s node %s",
+                run_id,
+                node_id,
+            )
+        await redis.delete(s_key, d_key, m_key)
 
     # ------------------------------------------------------------------ embed
     async def embed(self, text: str) -> list[float]:

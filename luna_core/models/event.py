@@ -41,6 +41,11 @@ class RunEventType(str, enum.Enum):
     agent_text_delta = "agent_text_delta"
     agent_thinking_delta = "agent_thinking_delta"
     agent_message_completed = "agent_message_completed"
+    # Built-in (provider-side) tool activity surfaced live, e.g. the Responses API
+    # running a web_search mid-turn. Transient + pub/sub-only (never persisted to
+    # run_events), like the *_delta events — so the UI can show "searching the
+    # web…" without a DB enum value.
+    builtin_tool_call = "builtin_tool_call"
     tool_called = "tool_called"
     tool_result = "tool_result"
     human_checkpoint = "human_checkpoint"

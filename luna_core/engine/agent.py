@@ -270,6 +270,7 @@ class AgentRunner:
                 node_id=node_id,
                 make_io=emitter.for_session,
                 image_resolver=image_resolver,
+                builtin_tools=list(getattr(agent, "builtin_tools", None) or []) or None,
             )
 
             if _debug_llm_calls_enabled():

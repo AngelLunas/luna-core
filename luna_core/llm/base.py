@@ -65,6 +65,7 @@ class BaseLLMProvider(Protocol):
         redis: Redis,
         make_io: IOFactory | None = None,
         image_resolver: Callable[[str], Awaitable[str | None]] | None = None,
+        builtin_tools: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Return canonical assistant content blocks for one tool-calling turn.
 

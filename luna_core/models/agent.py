@@ -45,6 +45,12 @@ class Agent(Base):
     required_sources: Mapped[list[str]] = mapped_column(
         ARRAY(Text), nullable=False, server_default="{}"
     )
+    # Provider built-in tools this agent uses (e.g. ["web_search"]). When set, the
+    # provider runs the turn on the OpenAI Responses API (built-in tools execute
+    # server-side) instead of chat-completions. Empty → normal chat-completions.
+    builtin_tools: Mapped[list[str]] = mapped_column(
+        ARRAY(Text), nullable=False, server_default="{}"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
