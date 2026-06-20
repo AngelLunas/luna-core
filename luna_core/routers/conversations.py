@@ -66,6 +66,13 @@ router = APIRouter(prefix="/conversations", tags=["conversations"])
 
 AgentResolver = Callable[[AsyncSession, Conversation], Awaitable[Agent]]
 
+# Multi-agent handoff: after a turn, the resolver is consulted again; if a tool
+# changed which agent is active (e.g. a terminal ``route_to_*`` tool), the same
+# request continues with the new agent on the existing history. Capped so a
+# misbehaving pair of agents can't ping-pong forever. A single-agent host never
+# trips this — the resolver returns the same agent and the loop exits at once.
+MAX_HANDOFF_HOPS = 4
+
 
 @dataclass
 class MeteringContext:
@@ -168,6 +175,9 @@ async def send(
         extra_call_context={"user_id": str(user.id)},
         attachments=attachments,
     )
+    agent, result = await _follow_handoffs(
+        db, request, conversation, redis, user.id, agent, result
+    )
     return await _turn_response(db, request, conversation_id, agent, user.id, result)
 
 
@@ -248,6 +258,9 @@ async def decide_tool_approval(
         system_prompt=agent.instructions or None,
         extra_call_context={"user_id": str(user.id)},
     )
+    agent, result = await _follow_handoffs(
+        db, request, conversation, redis, user.id, agent, result
+    )
     return await _turn_response(db, request, conversation_id, agent, user.id, result)
 
 
@@ -272,6 +285,43 @@ async def stream(websocket: WebSocket, conversation_id: uuid.UUID) -> None:
 
 
 # --- helpers ---
+async def _follow_handoffs(
+    db: AsyncSession,
+    request: Request,
+    conversation: Conversation,
+    redis: Any,
+    user_id: uuid.UUID,
+    agent: Agent,
+    result: Any,
+) -> tuple[Agent, Any]:
+    """Continue the request under a new agent while the resolver keeps changing.
+
+    A turn can hand the conversation off (a terminal ``route_to_*`` tool flips the
+    host's routing); we re-consult the resolver and, if the active agent changed,
+    run it on the existing history with no new user message so the now-active
+    agent answers in the same request. Stops when the agent stabilises, the turn
+    suspends for approval, or the hop cap is hit."""
+    runner = _chat_runner(request)
+    resolver = _agent_resolver(request)
+    hops = 0
+    while not isinstance(result, SuspendedForApproval) and hops < MAX_HANDOFF_HOPS:
+        next_agent = await resolver(db, conversation)
+        if next_agent.id == agent.id:
+            break
+        agent = next_agent
+        result = await runner.send(
+            agent=agent,
+            conversation_id=conversation.id,
+            new_message=None,
+            db=db,
+            redis=redis,
+            system_prompt=agent.instructions or None,
+            extra_call_context={"user_id": str(user_id)},
+        )
+        hops += 1
+    return agent, result
+
+
 async def _turn_response(
     db: AsyncSession,
     request: Request,

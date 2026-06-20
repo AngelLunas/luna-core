@@ -203,7 +203,7 @@ class ChatRunner:
         *,
         agent: Agent,
         conversation_id: uuid.UUID,
-        new_message: str,
+        new_message: str | None,
         db: AsyncSession,
         redis: Redis,
         system_prompt: str | None = None,
@@ -215,9 +215,13 @@ class ChatRunner:
         rows, and return the agent's final output (text, or a structured dict
         when the agent declares an output schema). ``attachments`` are extra
         content blocks for the user turn (e.g. ``{"type": "image", "media_id":
-        ...}``) the model/provider renders per its vision capability. If the turn
-        calls a tool the agent marks ``requires_approval``, the turn suspends and
-        returns ``SuspendedForApproval`` — resume via :meth:`resume`."""
+        ...}``) the model/provider renders per its vision capability.
+
+        ``new_message=None`` runs the agent over the existing history with no new
+        user turn — the continuation path a multi-agent host uses to let a second
+        agent answer after a handoff. If the turn calls a tool the agent marks
+        ``requires_approval``, the turn suspends and returns
+        ``SuspendedForApproval`` — resume via :meth:`resume`."""
         history = await self._load_history(db, conversation_id)
         io = ConversationIO(db, redis, conversation_id)
         return await self._runner.run(
