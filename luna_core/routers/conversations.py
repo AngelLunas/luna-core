@@ -171,12 +171,15 @@ async def send(
         new_message=payload.new_message,
         db=db,
         redis=redis,
-        system_prompt=agent.instructions or None,
+        system_prompt=await _augment_system_prompt(
+            request, db, conversation, agent, payload.new_message
+        ),
         extra_call_context={"user_id": str(user.id)},
         attachments=attachments,
     )
     agent, result = await _follow_handoffs(
-        db, request, conversation, redis, user.id, agent, result
+        db, request, conversation, redis, user.id, agent, result,
+        query=payload.new_message,
     )
     return await _turn_response(db, request, conversation_id, agent, user.id, result)
 
@@ -285,6 +288,34 @@ async def stream(websocket: WebSocket, conversation_id: uuid.UUID) -> None:
 
 
 # --- helpers ---
+async def _augment_system_prompt(
+    request: Request,
+    db: AsyncSession,
+    conversation: Conversation,
+    agent: Agent,
+    query: str | None,
+) -> str | None:
+    """Build the turn's system prompt, optionally enriched by a host RAG hook.
+
+    If the host registered ``app.state.chat_context_provider`` — an async
+    ``(db, conversation, agent, query) -> str | None`` — its returned text is
+    appended to the agent's instructions for this turn, so retrieved context
+    (e.g. the user's relevant past cases) is injected automatically rather than
+    relying on the model to call a search tool. Hosts without the hook are
+    unaffected; failures never break the turn."""
+    base = agent.instructions or None
+    provider = getattr(request.app.state, "chat_context_provider", None)
+    if provider is None or not query:
+        return base
+    try:
+        extra = await provider(db, conversation, agent, query)
+    except Exception:  # noqa: BLE001 — context augmentation must never break a turn
+        extra = None
+    if not extra:
+        return base
+    return f"{base}\n\n{extra}" if base else extra
+
+
 async def _follow_handoffs(
     db: AsyncSession,
     request: Request,
@@ -293,6 +324,7 @@ async def _follow_handoffs(
     user_id: uuid.UUID,
     agent: Agent,
     result: Any,
+    query: str | None = None,
 ) -> tuple[Agent, Any]:
     """Continue the request under a new agent while the resolver keeps changing.
 
@@ -315,7 +347,9 @@ async def _follow_handoffs(
             new_message=None,
             db=db,
             redis=redis,
-            system_prompt=agent.instructions or None,
+            system_prompt=await _augment_system_prompt(
+                request, db, conversation, agent, query
+            ),
             extra_call_context={"user_id": str(user_id)},
         )
         hops += 1

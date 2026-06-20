@@ -8,7 +8,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from luna_core.routers.conversations import MAX_HANDOFF_HOPS, _follow_handoffs
+from luna_core.routers.conversations import (
+    MAX_HANDOFF_HOPS,
+    _augment_system_prompt,
+    _follow_handoffs,
+)
 
 
 class _Agent:
@@ -84,3 +88,63 @@ async def test_pingpong_is_capped():
         None, request, convo, None, uuid.uuid4(), orch, "x"
     )
     assert len(calls) == MAX_HANDOFF_HOPS  # bounded, no infinite loop
+
+
+# --- optional RAG prompt augmentation -------------------------------------
+
+def _req_with_provider(provider) -> SimpleNamespace:
+    state = SimpleNamespace()
+    if provider is not None:
+        state.chat_context_provider = provider
+    return SimpleNamespace(app=SimpleNamespace(state=state))
+
+
+class _Ag:
+    def __init__(self, instructions: str) -> None:
+        self.instructions = instructions
+        self.name = "doctor"
+
+
+@pytest.mark.asyncio
+async def test_augment_noop_without_provider():
+    # No host hook → instructions are returned untouched (the feature is opt-in).
+    request = _req_with_provider(None)
+    out = await _augment_system_prompt(request, None, object(), _Ag("BASE"), "q")
+    assert out == "BASE"
+
+
+@pytest.mark.asyncio
+async def test_augment_appends_provider_context():
+    async def provider(_db, _conv, _agent, _query):
+        return "PAST CASES"
+
+    out = await _augment_system_prompt(
+        _req_with_provider(provider), None, object(), _Ag("BASE"), "q"
+    )
+    assert out == "BASE\n\nPAST CASES"
+
+
+@pytest.mark.asyncio
+async def test_augment_skips_when_no_query_or_empty_context():
+    async def provider(_db, _conv, _agent, _query):
+        return None
+
+    # empty query → provider not even consulted
+    assert await _augment_system_prompt(
+        _req_with_provider(provider), None, object(), _Ag("BASE"), ""
+    ) == "BASE"
+    # provider returns nothing → base unchanged
+    assert await _augment_system_prompt(
+        _req_with_provider(provider), None, object(), _Ag("BASE"), "q"
+    ) == "BASE"
+
+
+@pytest.mark.asyncio
+async def test_augment_never_raises_on_provider_error():
+    async def provider(_db, _conv, _agent, _query):
+        raise RuntimeError("retrieval down")
+
+    out = await _augment_system_prompt(
+        _req_with_provider(provider), None, object(), _Ag("BASE"), "q"
+    )
+    assert out == "BASE"  # failures degrade to the base prompt
