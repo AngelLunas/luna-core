@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
@@ -56,6 +56,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Resolves a media_id to a URL the provider can put on an ``image_url`` content
+# part — in practice a ``data:`` base64 URL (works for both local-dev storage
+# and object storage without exposing a public/signed URL). Host-injected
+# (the host owns its media table + storage); ``None`` means "could not resolve",
+# in which case the image falls back to a text note.
+ImageResolver = Callable[[str], Awaitable[str | None]]
+
 
 def _tools_to_openai(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
     return [
@@ -74,12 +81,20 @@ def _tools_to_openai(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
 def _canonical_to_openai_messages(
     messages: list[dict[str, Any]],
     system: str,
+    image_urls: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Translate canonical conversation history into OpenAI chat-completions
     `messages` array. Each canonical message is either:
       {"role": "user", "content": [<blocks>]}
       {"role": "assistant", "content": [<blocks>]}
       {"role": "system", "content": "..."} (rare — system is normally a param)
+
+    ``image_urls`` maps ``media_id`` → a renderable URL (typically a ``data:``
+    base64 URL). When supplied and an attached image resolves, that user turn is
+    emitted as an OpenAI multimodal ``content`` parts list (text + ``image_url``)
+    so a vision model sees the pixels; unresolved images (and the no-map case)
+    fall back to the ``[image attached: media_id=…]`` text note a text model can
+    still pass to a tool.
     """
     result: list[dict[str, Any]] = []
     if system:
@@ -105,18 +120,44 @@ def _canonical_to_openai_messages(
                         }
                     )
             if text_blocks or image_blocks:
-                parts = [b.get("text", "") for b in text_blocks]
-                # Attached media: render each as a text note so a text model
-                # knows a media is present and can pass its id to a tool. A
-                # vision-native model renders these as image_url parts instead
-                # (added with the M3 image resolver).
-                parts += [
-                    f"[image attached: media_id={b.get('media_id')}]"
+                resolved = [
+                    (b, (image_urls or {}).get(str(b.get("media_id"))))
                     for b in image_blocks
                 ]
-                text = "\n".join(p for p in parts if p)
-                if text:
-                    result.append({"role": "user", "content": text})
+                rendered = [(b, url) for b, url in resolved if url]
+                joined_text = "\n".join(
+                    b.get("text", "") for b in text_blocks if b.get("text")
+                )
+                if rendered:
+                    # Vision path: emit a multimodal content parts list. Any
+                    # image we could NOT resolve still rides as a text note.
+                    note = "\n".join(
+                        f"[image attached: media_id={b.get('media_id')}]"
+                        for b, url in resolved
+                        if not url
+                    )
+                    full_text = "\n".join(t for t in (joined_text, note) if t)
+                    parts: list[dict[str, Any]] = []
+                    if full_text:
+                        parts.append({"type": "text", "text": full_text})
+                    for _b, url in rendered:
+                        parts.append(
+                            {"type": "image_url", "image_url": {"url": url}}
+                        )
+                    result.append({"role": "user", "content": parts})
+                else:
+                    # Text path: render each attached media as a text note so a
+                    # text model knows a media is present and can pass its id to
+                    # a tool.
+                    notes = [
+                        f"[image attached: media_id={b.get('media_id')}]"
+                        for b in image_blocks
+                    ]
+                    text = "\n".join(
+                        p for p in [joined_text, *notes] if p
+                    )
+                    if text:
+                        result.append({"role": "user", "content": text})
         elif role == "assistant":
             text_parts: list[str] = []
             tool_calls: list[dict[str, Any]] = []
@@ -290,6 +331,7 @@ class GenericProvider:
         node_id: str,
         redis: Redis,
         make_io: IOFactory | None = None,
+        image_resolver: ImageResolver | None = None,
     ) -> list[dict[str, Any]]:
         accumulator = _StreamAccumulator()
         a_key = abort_key(run_id)
@@ -330,9 +372,16 @@ class GenericProvider:
         # Final-chunk token usage (when the provider honors stream_options).
         final_usage: Any = None
 
+        # Pre-resolve attached-image media_ids to renderable URLs before the
+        # (sync) message builder runs. Only when a resolver is injected — the
+        # text-only path (no resolver) is byte-identical to before.
+        image_urls = await self._resolve_image_urls(messages, image_resolver)
+
         request: dict[str, Any] = {
             "model": model or self._default_model,
-            "messages": _canonical_to_openai_messages(messages, system),
+            "messages": _canonical_to_openai_messages(
+                messages, system, image_urls or None
+            ),
             "temperature": temperature,
             "stream": True,
             # Ask the provider for a final usage-only chunk (real token counts).
@@ -519,6 +568,32 @@ class GenericProvider:
         return list(response.data[0].embedding)
 
     # ----------------------------------------------------------------- helpers
+    async def _resolve_image_urls(
+        self,
+        messages: list[dict[str, Any]],
+        image_resolver: ImageResolver | None,
+    ) -> dict[str, str]:
+        """Resolve every distinct attached-image ``media_id`` to a renderable
+        URL via the injected resolver. No resolver → empty map (text-note path).
+        Each id is resolved once even if it recurs across turns."""
+        if image_resolver is None:
+            return {}
+        urls: dict[str, str] = {}
+        for msg in messages:
+            for block in msg.get("content", []) or []:
+                if not isinstance(block, dict) or block.get("type") != "image":
+                    continue
+                media_id = block.get("media_id")
+                if media_id is None:
+                    continue
+                key = str(media_id)
+                if key in urls:
+                    continue
+                url = await image_resolver(key)
+                if url:
+                    urls[key] = url
+        return urls
+
     async def _push_stream(
         self,
         redis: Redis,

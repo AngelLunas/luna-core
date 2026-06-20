@@ -358,6 +358,8 @@ async def run_sub_agent(
     redis: Redis,
     system_prompt: str | None = None,
     system_tool_registry: SystemToolRegistry | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+    image_resolver: Any | None = None,
 ) -> SubAgentResult:
     """Run ``agent`` as a sub-agent to completion and return its output.
 
@@ -387,6 +389,8 @@ async def run_sub_agent(
         db=db,
         redis=redis,
         system_prompt=system_prompt,
+        attachments=attachments,
+        image_resolver=image_resolver,
     )
     return SubAgentResult(output=output, scope_id=scope_id)
 

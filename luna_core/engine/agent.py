@@ -157,6 +157,7 @@ class AgentRunner:
         extra_call_context: dict[str, Any] | None = None,
         approval_enabled: bool = False,
         attachments: list[dict[str, Any]] | None = None,
+        image_resolver: Any | None = None,
     ) -> dict[str, Any] | str | SuspendedForApproval:
         # ----- prepare tools ------------------------------------------------
         llm_tools, system_by_name = await self._resolve_tools(
@@ -212,6 +213,13 @@ class AgentRunner:
             "node_id": node_id,
             "redis": redis,
             "db": db,
+            # The engine handles a tool needs to compose a nested LLM call (e.g.
+            # an ``inspect_image`` tool that runs a one-shot vision sub-agent via
+            # ``run_sub_agent``). Exposed here so a host system tool reaches them
+            # without the host having to re-wire its own router/client.
+            "llm_router": self._llm,
+            "mcp_client": self._mcp,
+            "system_tool_registry": self._system_tools,
         }
         if extra_call_context:
             call_context.update(extra_call_context)
@@ -261,6 +269,7 @@ class AgentRunner:
                 run_id=scope_id,
                 node_id=node_id,
                 make_io=emitter.for_session,
+                image_resolver=image_resolver,
             )
 
             if _debug_llm_calls_enabled():
@@ -504,6 +513,9 @@ class AgentRunner:
             "node_id": node_id,
             "redis": redis,
             "db": db,
+            "llm_router": self._llm,
+            "mcp_client": self._mcp,
+            "system_tool_registry": self._system_tools,
         }
         if extra_call_context:
             call_context.update(extra_call_context)

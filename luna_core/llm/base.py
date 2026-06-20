@@ -15,6 +15,7 @@ content-block list used throughout luna-core. The canonical format is:
 from __future__ import annotations
 
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Protocol
 
 from pydantic import BaseModel, Field
@@ -63,6 +64,7 @@ class BaseLLMProvider(Protocol):
         node_id: str,
         redis: Redis,
         make_io: IOFactory | None = None,
+        image_resolver: Callable[[str], Awaitable[str | None]] | None = None,
     ) -> list[dict[str, Any]]:
         """Return canonical assistant content blocks for one tool-calling turn.
 
@@ -71,6 +73,10 @@ class BaseLLMProvider(Protocol):
         emitter), bound to sessions the provider opens itself. When omitted,
         the provider falls back to the flow ``EventEmitter`` for the given
         ``run_id`` — preserving the original behavior for direct callers.
+
+        ``image_resolver`` maps an attached image ``media_id`` to a renderable
+        URL (typically a ``data:`` base64 URL) so a vision model sees the pixels.
+        Omitted → attached images render as text notes (the text-model path).
         """
 
     async def embed(self, text: str) -> list[float]:

@@ -124,6 +124,7 @@ class LLMRouter:
         run_id: uuid.UUID,
         node_id: str,
         make_io: IOFactory | None = None,
+        image_resolver: Callable[[str], Any] | None = None,
     ) -> list[dict[str, Any]]:
         attempt = 0
         last_exc: Exception | None = None
@@ -142,6 +143,7 @@ class LLMRouter:
                     node_id=node_id,
                     redis=self._redis,
                     make_io=make_io,
+                    image_resolver=image_resolver,
                 )
             except AbortSignalError:
                 raise
