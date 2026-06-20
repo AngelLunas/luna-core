@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import uuid
+from dataclasses import dataclass, field
 from typing import Any
 
 import jsonschema
@@ -36,7 +37,7 @@ from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from luna_core.engine.emitter import EventEmitter
+from luna_core.engine.streaming import AgentIO
 from luna_core.llm.base import ToolDefinition as LLMToolDefinition
 from luna_core.llm.router import LLMRouter
 from luna_core.mcp.client import MCPClient
@@ -45,8 +46,43 @@ from luna_core.mcp.system_tools import SystemTool, SystemToolRegistry, get_defau
 from luna_core.models.agent import Agent, AgentOperation, AgentSystemToolGrant
 from luna_core.models.connector import Operation
 from luna_core.models.event import AgentMessageRole, RunEventType
+from luna_core.models.tool_approval import ToolApproval, ToolApprovalStatus
+from luna_core.services.tool_approval import (
+    create_pending_approvals,
+    decisions_by_tool_use,
+)
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SuspendedForApproval:
+    """Returned by ``run``/``resume`` when a chat turn pauses awaiting human
+    approval for one or more gated tool calls. The conversation is durable (the
+    ``ToolApproval`` rows are persisted); resuming happens via ``resume`` once
+    the rows are resolved."""
+
+    approvals: list[ToolApproval] = field(default_factory=list)
+
+
+def _should_reinvoke(
+    tool_uses: list[dict[str, Any]],
+    decisions: dict[str, ToolApproval],
+) -> bool:
+    """Decide whether to re-call the LLM after resolving a suspended turn.
+
+    Re-invoke unless EVERY tool_use was rejected AND none carried a reason. Any
+    executed tool (approved, or never gated → auto) or any reject-with-reason
+    means the LLM should see the outcome and respond."""
+    any_executed = False
+    any_reason = False
+    for tool_use in tool_uses:
+        decision = decisions.get(tool_use.get("id", ""))
+        if decision is None or decision.status != ToolApprovalStatus.rejected.value:
+            any_executed = True  # approved or never-gated (auto)
+        elif decision.reason:
+            any_reason = True
+    return any_executed or any_reason
 
 
 class AgentRunnerError(RuntimeError):
@@ -111,61 +147,47 @@ class AgentRunner:
         agent: Agent,
         history: list[dict[str, Any]],
         new_message: str | None,
-        flow_run_id: uuid.UUID,
+        scope_id: uuid.UUID,
         node_id: str,
-        emitter: EventEmitter,
+        emitter: AgentIO,
         db: AsyncSession,
         redis: Redis,
         system_prompt: str | None = None,
         context_tool_names: list[str] | None = None,
         extra_call_context: dict[str, Any] | None = None,
-    ) -> dict[str, Any] | str:
+        approval_enabled: bool = False,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | str | SuspendedForApproval:
         # ----- prepare tools ------------------------------------------------
-        allowed_names = await self._allowed_tool_names(db, agent.id)
-
-        # Catalog system tools are eligible for the same per-agent filter
-        # MCP tools go through. Until the DB-seeding work lands, agents
-        # without explicit assignments see all catalog tools (matches the
-        # existing unfiltered-defaults behavior for MCP tools).
-        catalog_tools = self._system_tools.list_catalog()
-        if allowed_names is not None:
-            catalog_tools = [t for t in catalog_tools if t.name in allowed_names]
-
-        # Context tools are injected by the caller for this run only and
-        # bypass the allowed-names filter — they're intrinsic to the
-        # runtime context (e.g. yield_iteration in iterative nodes), not
-        # a per-agent capability the user toggles.
-        context_tools = self._system_tools.get_many(context_tool_names or [])
-
-        # MCP tools are listed last and filtered by the allowed-names set
-        # (when one exists). Their names compete with system tool names
-        # in the dispatcher — system tools win because we check the
-        # registry first.
-        mcp_tools = await self._mcp.list_tools()
-        if allowed_names is not None:
-            mcp_tools = [t for t in mcp_tools if t.name in allowed_names]
-
-        # Combine for LLM advertisement. Order matters only for human
-        # readability of the resulting list; the dispatcher is name-keyed.
-        llm_tools = [
-            *(_system_to_llm_tool(t) for t in context_tools),
-            *(_system_to_llm_tool(t) for t in catalog_tools),
-            *(_to_llm_tool(t) for t in mcp_tools),
-        ]
-        system_by_name: dict[str, SystemTool] = {
-            t.name: t for t in (*context_tools, *catalog_tools)
-        }
+        llm_tools, system_by_name = await self._resolve_tools(
+            db, agent.id, context_tool_names
+        )
+        # Per-agent set of tool names that require human approval before they
+        # run. Only consulted when the caller opts in (chat); empty otherwise,
+        # so the flow path is unchanged.
+        approval_names = (
+            await self._approval_required_names(db, agent.id)
+            if approval_enabled
+            else set()
+        )
 
         # ----- build canonical message history -----------------------------
+        # A user turn is text plus any attached media blocks (e.g.
+        # {"type": "image", "media_id": ...}) — the caller passes attachments;
+        # the provider renders them per the agent's vision capability.
         messages: list[dict[str, Any]] = list(history)
+        user_content: list[dict[str, Any]] = []
         if new_message:
-            user_block = {"type": "text", "text": new_message}
-            await emitter.save_agent_message(
+            user_content.append({"type": "text", "text": new_message})
+        if attachments:
+            user_content.extend(attachments)
+        if user_content:
+            await emitter.save_message(
                 node_id=node_id,
                 role=AgentMessageRole.user,
-                content=[user_block],
+                content=user_content,
             )
-            messages.append({"role": "user", "content": [user_block]})
+            messages.append({"role": "user", "content": user_content})
 
         await emitter.emit(
             RunEventType.agent_thinking,
@@ -181,7 +203,12 @@ class AgentRunner:
         # callers like the iteration runtime can pass iteration_index
         # without us having to know about it here.
         call_context: dict[str, Any] = {
-            "flow_run_id": flow_run_id,
+            "scope_id": scope_id,
+            # Retained for the flow-iteration scratchpad tools (stash_records /
+            # list_scratchpad), which partition by it. Equal to scope_id; chat
+            # agents aren't granted those tools, so it's never read off a
+            # conversation scope.
+            "flow_run_id": scope_id,
             "node_id": node_id,
             "redis": redis,
             "db": db,
@@ -231,8 +258,9 @@ class AgentRunner:
                 temperature=agent.temperature,
                 model=agent.model,
                 output_schema=output_schema if not llm_tools else None,
-                run_id=flow_run_id,
+                run_id=scope_id,
                 node_id=node_id,
+                make_io=emitter.for_session,
             )
 
             if _debug_llm_calls_enabled():
@@ -262,80 +290,45 @@ class AgentRunner:
             if not tool_uses:
                 return await self._finalize_output(response_blocks, output_schema)
 
-            tool_result_blocks: list[dict[str, Any]] = []
-            terminal_value: Any = None
-            terminal_called = False
-            for tool_use in tool_uses:
-                tool_name = tool_use.get("name", "")
-                tool_input = tool_use.get("input", {}) or {}
-                tool_call_id = tool_use.get("id", "")
-
-                await emitter.emit(
-                    RunEventType.tool_called,
-                    node_id=node_id,
-                    payload={
-                        "tool_use_id": tool_call_id,
-                        "name": tool_name,
-                        "input": tool_input,
-                    },
+            # Human-in-the-loop: if any tool_use in this turn needs approval for
+            # this agent, suspend the WHOLE turn — persist the intent and return.
+            # The assistant message (with its tool_use blocks) is already durable,
+            # so resume reconstructs everything from the conversation. Nothing in
+            # this turn executes until the user decides.
+            if approval_names and any(
+                tu.get("name", "") in approval_names for tu in tool_uses
+            ):
+                gated = [
+                    tu for tu in tool_uses if tu.get("name", "") in approval_names
+                ]
+                created = await create_pending_approvals(
+                    db, conversation_id=scope_id, tool_uses=gated
                 )
-
-                system_tool = system_by_name.get(tool_name)
-                if system_tool is not None:
-                    payload_content, is_error = await _invoke_system_tool(
-                        system_tool, tool_input, call_context
-                    )
-                    tool_result_blocks.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_call_id,
-                            "content": payload_content,
-                            **({"is_error": True} if is_error else {}),
-                        }
-                    )
+                for ap in created:
                     await emitter.emit(
-                        RunEventType.tool_result,
+                        RunEventType.tool_approval_required,
                         node_id=node_id,
                         payload={
-                            "tool_use_id": tool_call_id,
-                            "name": tool_name,
-                            "is_error": is_error,
-                            "output_preview": _preview(payload_content),
+                            "approval_id": str(ap.id),
+                            "tool_use_id": ap.tool_use_id,
+                            "name": ap.tool_name,
+                            "input": ap.tool_input,
                         },
                     )
-                    if system_tool.terminal and not is_error:
-                        terminal_called = True
-                        terminal_value = tool_input
-                    continue
+                return SuspendedForApproval(approvals=created)
 
-                result = await self._mcp.call_tool(tool_name, tool_input)
-                payload_content = (
-                    result.error_message if result.is_error else result.output
-                )
-                if not isinstance(payload_content, str):
-                    payload_content = json.dumps(payload_content, default=str)
-
-                tool_result_blocks.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tool_call_id,
-                        "content": payload_content,
-                        **({"is_error": True} if result.is_error else {}),
-                    }
-                )
-
-                await emitter.emit(
-                    RunEventType.tool_result,
+            tool_result_blocks, terminal_called, terminal_value = (
+                await self._execute_tool_uses(
+                    tool_uses,
+                    decisions=None,
+                    system_by_name=system_by_name,
+                    call_context=call_context,
+                    emitter=emitter,
                     node_id=node_id,
-                    payload={
-                        "tool_use_id": tool_call_id,
-                        "name": tool_name,
-                        "is_error": result.is_error,
-                        "output_preview": _preview(payload_content),
-                    },
                 )
+            )
 
-            await emitter.save_agent_message(
+            await emitter.save_message(
                 node_id=node_id,
                 role=AgentMessageRole.user,
                 content=tool_result_blocks,
@@ -353,7 +346,275 @@ class AgentRunner:
             f"agent exceeded MAX_TOOL_ITERATIONS={MAX_TOOL_ITERATIONS}"
         )
 
+    async def _execute_tool_uses(
+        self,
+        tool_uses: list[dict[str, Any]],
+        *,
+        decisions: dict[str, ToolApproval] | None,
+        system_by_name: dict[str, SystemTool],
+        call_context: dict[str, Any],
+        emitter: AgentIO,
+        node_id: str,
+    ) -> tuple[list[dict[str, Any]], bool, Any]:
+        """Run a turn's ``tool_use`` blocks into ``tool_result`` blocks.
+
+        When ``decisions`` is supplied (resume after approval), a tool_use whose
+        approval was **rejected** yields a rejection tool_result instead of
+        running; approved or never-gated ones run normally. Returns
+        ``(tool_result_blocks, terminal_called, terminal_value)``."""
+        tool_result_blocks: list[dict[str, Any]] = []
+        terminal_value: Any = None
+        terminal_called = False
+        for tool_use in tool_uses:
+            tool_name = tool_use.get("name", "")
+            tool_input = tool_use.get("input", {}) or {}
+            tool_call_id = tool_use.get("id", "")
+
+            decision = decisions.get(tool_call_id) if decisions else None
+            if (
+                decision is not None
+                and decision.status == ToolApprovalStatus.rejected.value
+            ):
+                content = "The user rejected this tool call and it was not run."
+                if decision.reason:
+                    content += f" Reason: {decision.reason}"
+                tool_result_blocks.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_call_id,
+                        "content": content,
+                        "is_error": True,
+                    }
+                )
+                await emitter.emit(
+                    RunEventType.tool_result,
+                    node_id=node_id,
+                    payload={
+                        "tool_use_id": tool_call_id,
+                        "name": tool_name,
+                        "is_error": True,
+                        "output_preview": _preview(content),
+                    },
+                )
+                continue
+
+            await emitter.emit(
+                RunEventType.tool_called,
+                node_id=node_id,
+                payload={
+                    "tool_use_id": tool_call_id,
+                    "name": tool_name,
+                    "input": tool_input,
+                },
+            )
+
+            system_tool = system_by_name.get(tool_name)
+            if system_tool is not None:
+                payload_content, is_error = await _invoke_system_tool(
+                    system_tool, tool_input, call_context
+                )
+                tool_result_blocks.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_call_id,
+                        "content": payload_content,
+                        **({"is_error": True} if is_error else {}),
+                    }
+                )
+                await emitter.emit(
+                    RunEventType.tool_result,
+                    node_id=node_id,
+                    payload={
+                        "tool_use_id": tool_call_id,
+                        "name": tool_name,
+                        "is_error": is_error,
+                        "output_preview": _preview(payload_content),
+                    },
+                )
+                if system_tool.terminal and not is_error:
+                    terminal_called = True
+                    terminal_value = tool_input
+                continue
+
+            result = await self._mcp.call_tool(tool_name, tool_input)
+            payload_content = (
+                result.error_message if result.is_error else result.output
+            )
+            if not isinstance(payload_content, str):
+                payload_content = json.dumps(payload_content, default=str)
+
+            tool_result_blocks.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_call_id,
+                    "content": payload_content,
+                    **({"is_error": True} if result.is_error else {}),
+                }
+            )
+
+            await emitter.emit(
+                RunEventType.tool_result,
+                node_id=node_id,
+                payload={
+                    "tool_use_id": tool_call_id,
+                    "name": tool_name,
+                    "is_error": result.is_error,
+                    "output_preview": _preview(payload_content),
+                },
+            )
+
+        return tool_result_blocks, terminal_called, terminal_value
+
+    async def resume(
+        self,
+        agent: Agent,
+        history: list[dict[str, Any]],
+        scope_id: uuid.UUID,
+        node_id: str,
+        emitter: AgentIO,
+        db: AsyncSession,
+        redis: Redis,
+        system_prompt: str | None = None,
+        context_tool_names: list[str] | None = None,
+        extra_call_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | str | SuspendedForApproval:
+        """Resume a turn that suspended for approval.
+
+        ``history`` ends with the assistant message holding the gated
+        ``tool_use`` blocks, and every approval for this conversation is now
+        resolved. Executes the decided tools (rejected → rejection tool_result),
+        persists the tool_result message, then either re-invokes the LLM by
+        continuing the loop (``run(new_message=None)``) or, when the whole turn
+        was rejected with no reasons, ends the turn without calling the LLM."""
+        if not history or history[-1].get("role") != "assistant":
+            raise AgentRunnerError("resume: history must end with an assistant turn")
+        tool_uses = [
+            b for b in history[-1].get("content", []) if b.get("type") == "tool_use"
+        ]
+        if not tool_uses:
+            raise AgentRunnerError("resume: last assistant message has no tool_use")
+
+        decisions = await decisions_by_tool_use(db, scope_id)
+        _, system_by_name = await self._resolve_tools(
+            db, agent.id, context_tool_names
+        )
+        call_context: dict[str, Any] = {
+            "scope_id": scope_id,
+            "flow_run_id": scope_id,
+            "node_id": node_id,
+            "redis": redis,
+            "db": db,
+        }
+        if extra_call_context:
+            call_context.update(extra_call_context)
+
+        for ap in decisions.values():
+            await emitter.emit(
+                RunEventType.tool_approval_resolved,
+                node_id=node_id,
+                payload={
+                    "tool_use_id": ap.tool_use_id,
+                    "name": ap.tool_name,
+                    "status": ap.status,
+                },
+            )
+
+        tool_result_blocks, _terminal, _terminal_value = (
+            await self._execute_tool_uses(
+                tool_uses,
+                decisions=decisions,
+                system_by_name=system_by_name,
+                call_context=call_context,
+                emitter=emitter,
+                node_id=node_id,
+            )
+        )
+        await emitter.save_message(
+            node_id=node_id,
+            role=AgentMessageRole.user,
+            content=tool_result_blocks,
+        )
+        messages = [*history, {"role": "user", "content": tool_result_blocks}]
+
+        if not _should_reinvoke(tool_uses, decisions):
+            # Whole turn rejected with no reasons → don't call the LLM; the
+            # rejection is recorded in history and the turn ends here.
+            return ""
+
+        # Continue the loop with the full reconstructed context and no new user
+        # message — run() runs the loop over `messages` as-is.
+        return await self.run(
+            agent=agent,
+            history=messages,
+            new_message=None,
+            scope_id=scope_id,
+            node_id=node_id,
+            emitter=emitter,
+            db=db,
+            redis=redis,
+            system_prompt=system_prompt,
+            context_tool_names=context_tool_names,
+            extra_call_context=extra_call_context,
+            approval_enabled=True,
+        )
+
     # ------------------------------------------------------------------ helpers
+    async def _resolve_tools(
+        self,
+        db: AsyncSession,
+        agent_id: uuid.UUID,
+        context_tool_names: list[str] | None,
+    ) -> tuple[list[LLMToolDefinition], dict[str, SystemTool]]:
+        """Assemble the agent's advertised tool list + the name→system-tool map
+        the dispatcher uses. Context and catalog system tools are advertised
+        first and win name collisions over MCP tools (the dispatcher checks the
+        registry before the MCP client)."""
+        allowed_names = await self._allowed_tool_names(db, agent_id)
+
+        catalog_tools = self._system_tools.list_catalog()
+        if allowed_names is not None:
+            catalog_tools = [t for t in catalog_tools if t.name in allowed_names]
+
+        context_tools = self._system_tools.get_many(context_tool_names or [])
+
+        mcp_tools = await self._mcp.list_tools()
+        if allowed_names is not None:
+            mcp_tools = [t for t in mcp_tools if t.name in allowed_names]
+
+        llm_tools = [
+            *(_system_to_llm_tool(t) for t in context_tools),
+            *(_system_to_llm_tool(t) for t in catalog_tools),
+            *(_to_llm_tool(t) for t in mcp_tools),
+        ]
+        system_by_name: dict[str, SystemTool] = {
+            t.name: t for t in (*context_tools, *catalog_tools)
+        }
+        return llm_tools, system_by_name
+
+    async def _approval_required_names(
+        self, db: AsyncSession, agent_id: uuid.UUID
+    ) -> set[str]:
+        """Tool names this agent must get human approval for — the union of MCP
+        operations and system-tool grants flagged ``requires_approval``."""
+        op_result = await db.execute(
+            select(Operation.name)
+            .join(AgentOperation, AgentOperation.operation_id == Operation.id)
+            .where(
+                AgentOperation.agent_id == agent_id,
+                AgentOperation.requires_approval.is_(True),
+            )
+        )
+        names = {row[0] for row in op_result.all()}
+
+        grant_result = await db.execute(
+            select(AgentSystemToolGrant.tool_name).where(
+                AgentSystemToolGrant.agent_id == agent_id,
+                AgentSystemToolGrant.requires_approval.is_(True),
+            )
+        )
+        names |= {row[0] for row in grant_result.all()}
+        return names
+
     async def _allowed_tool_names(
         self, db: AsyncSession, agent_id: uuid.UUID
     ) -> set[str] | None:

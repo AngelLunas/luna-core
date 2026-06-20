@@ -17,7 +17,7 @@ import uuid
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,6 +33,9 @@ from luna_core.llm.base import (
 from luna_core.llm.providers.generic import GenericProvider
 from luna_core.models.llm_provider import LLMProvider
 from luna_core.services.llm_provider import get_decrypted_api_key
+
+if TYPE_CHECKING:
+    from luna_core.engine.streaming import IOFactory
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +123,7 @@ class LLMRouter:
         output_schema: dict[str, Any] | None,
         run_id: uuid.UUID,
         node_id: str,
+        make_io: IOFactory | None = None,
     ) -> list[dict[str, Any]]:
         attempt = 0
         last_exc: Exception | None = None
@@ -137,6 +141,7 @@ class LLMRouter:
                     run_id=run_id,
                     node_id=node_id,
                     redis=self._redis,
+                    make_io=make_io,
                 )
             except AbortSignalError:
                 raise

@@ -30,7 +30,7 @@ import uuid
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from openai import AsyncOpenAI, RateLimitError
 from redis.asyncio import Redis
@@ -49,6 +49,10 @@ from luna_core.llm.base import (
     stream_key,
 )
 from luna_core.models.event import AgentMessageRole, RunEventType
+from luna_core.services.usage import record_usage
+
+if TYPE_CHECKING:
+    from luna_core.engine.streaming import IOFactory
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +91,7 @@ def _canonical_to_openai_messages(
         if role == "user":
             tool_results = [b for b in content if b.get("type") == "tool_result"]
             text_blocks = [b for b in content if b.get("type") == "text"]
+            image_blocks = [b for b in content if b.get("type") == "image"]
             if tool_results:
                 for block in tool_results:
                     payload = block.get("content")
@@ -99,13 +104,19 @@ def _canonical_to_openai_messages(
                             "content": payload,
                         }
                     )
-            if text_blocks:
-                result.append(
-                    {
-                        "role": "user",
-                        "content": "\n".join(b.get("text", "") for b in text_blocks),
-                    }
-                )
+            if text_blocks or image_blocks:
+                parts = [b.get("text", "") for b in text_blocks]
+                # Attached media: render each as a text note so a text model
+                # knows a media is present and can pass its id to a tool. A
+                # vision-native model renders these as image_url parts instead
+                # (added with the M3 image resolver).
+                parts += [
+                    f"[image attached: media_id={b.get('media_id')}]"
+                    for b in image_blocks
+                ]
+                text = "\n".join(p for p in parts if p)
+                if text:
+                    result.append({"role": "user", "content": text})
         elif role == "assistant":
             text_parts: list[str] = []
             tool_calls: list[dict[str, Any]] = []
@@ -278,9 +289,20 @@ class GenericProvider:
         run_id: uuid.UUID,
         node_id: str,
         redis: Redis,
+        make_io: IOFactory | None = None,
     ) -> list[dict[str, Any]]:
         accumulator = _StreamAccumulator()
         a_key = abort_key(run_id)
+
+        # Where this assistant turn and its lifecycle events get persisted.
+        # The caller injects a scope-bound factory (flow EventEmitter or chat
+        # emitter); we call it with the short-lived sessions we open below, so
+        # this loop never needs to know which context it's running in. Absent
+        # an injection we default to the flow emitter for ``run_id`` — keeping
+        # behavior identical for any direct caller.
+        build_io = make_io or (
+            lambda session: EventEmitter(session, redis, run_id)
+        )
 
         # One assistant turn = one message_id. Generated here so that every
         # *_delta we publish AND the final AgentMessage row share the same
@@ -305,12 +327,19 @@ class GenericProvider:
         # atomic across whatever process is driving the stream.
         delta_seq_base = 0
         delta_seq_redis_key = f"delta_seq:{run_id}:{message_id}"
+        # Final-chunk token usage (when the provider honors stream_options).
+        final_usage: Any = None
 
         request: dict[str, Any] = {
             "model": model or self._default_model,
             "messages": _canonical_to_openai_messages(messages, system),
             "temperature": temperature,
             "stream": True,
+            # Ask the provider for a final usage-only chunk (real token counts).
+            # It arrives with empty ``choices`` and is captured below; the
+            # streamed/persisted output is unchanged (that chunk carries no
+            # content), so the flow path stays behavior-identical.
+            "stream_options": {"include_usage": True},
         }
         if tools:
             request["tools"] = _tools_to_openai(tools)
@@ -334,12 +363,17 @@ class GenericProvider:
 
         try:
             async for chunk in stream:
+                # Usage rides the final chunk (empty choices); capture before
+                # the choices guard skips it.
+                chunk_usage = getattr(chunk, "usage", None)
+                if chunk_usage is not None:
+                    final_usage = chunk_usage
                 if not chunk.choices:
                     continue
                 # abort check FIRST — short-circuit before doing any work
                 if await redis.exists(a_key):
                     await self._save_partial(
-                        accumulator, run_id, node_id, redis, message_id
+                        accumulator, run_id, node_id, redis, message_id, build_io
                     )
                     raise AbortSignalError(run_id, node_id)
 
@@ -355,7 +389,7 @@ class GenericProvider:
                 if content_text or thinking_text or tool_call_deltas:
                     if not message_started:
                         started_seq = await self._emit(
-                            redis,
+                            build_io,
                             run_id,
                             RunEventType.agent_message_started,
                             node_id,
@@ -429,19 +463,19 @@ class GenericProvider:
             raise
         except RateLimitError as exc:
             await self._save_partial(
-                accumulator, run_id, node_id, redis, message_id
+                accumulator, run_id, node_id, redis, message_id, build_io
             )
             raise LLMRateLimitError(str(exc)) from exc
         except Exception:
             await self._save_partial(
-                accumulator, run_id, node_id, redis, message_id
+                accumulator, run_id, node_id, redis, message_id, build_io
             )
             raise
 
         blocks, thinking = accumulator.to_canonical()
         async with self._session_factory() as db:
-            emitter = EventEmitter(db, redis, run_id)
-            await emitter.save_agent_message(
+            emitter = build_io(db)
+            await emitter.save_message(
                 node_id=node_id,
                 role=AgentMessageRole.assistant,
                 content=blocks,
@@ -458,6 +492,17 @@ class GenericProvider:
                         "text_chunks": text_chunk_index,
                         "thinking_chunks": thinking_chunk_index,
                     },
+                )
+            # Record the turn's real token cost on the same session/transaction
+            # as its transcript. Only when the provider returned usage — keeps
+            # the no-usage path (and its tests) untouched.
+            if final_usage is not None:
+                await record_usage(
+                    db,
+                    scope_id=run_id,
+                    message_id=message_id,
+                    model=request["model"],
+                    usage=final_usage,
                 )
             await db.commit()
         await redis.delete(
@@ -528,7 +573,7 @@ class GenericProvider:
 
     async def _emit(
         self,
-        redis: Redis,
+        build_io: IOFactory,
         run_id: uuid.UUID,
         event_type: RunEventType,
         node_id: str,
@@ -536,11 +581,14 @@ class GenericProvider:
     ) -> int | None:
         """Persist + broadcast an event. Returns the assigned sequence so
         the caller can base downstream synthetic-sequence math on it
-        (e.g. transient delta events that ride above the same baseline)."""
+        (e.g. transient delta events that ride above the same baseline).
+
+        ``run_id`` is retained only for the failure log; persistence goes
+        through the injected ``build_io`` factory."""
         # Opens a short-lived session per event so the streaming loop never
         # holds a transaction open while awaiting the next LLM chunk.
         async with self._session_factory() as db:
-            emitter = EventEmitter(db, redis, run_id)
+            emitter = build_io(db)
             try:
                 event = await emitter.emit(
                     event_type, node_id=node_id, payload=payload
@@ -580,6 +628,7 @@ class GenericProvider:
         node_id: str,
         redis: Redis,
         message_id: uuid.UUID,
+        build_io: IOFactory,
     ) -> None:
         # All three keys are per-message: deleting them on partial save
         # only affects this turn's cache, never a sibling iteration's
@@ -593,8 +642,8 @@ class GenericProvider:
             return
         try:
             async with self._session_factory() as db:
-                emitter = EventEmitter(db, redis, run_id)
-                await emitter.save_agent_message(
+                emitter = build_io(db)
+                await emitter.save_message(
                     node_id=node_id,
                     role=AgentMessageRole.assistant,
                     content=blocks,

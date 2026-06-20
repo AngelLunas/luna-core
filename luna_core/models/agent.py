@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     Float,
     ForeignKey,
@@ -89,6 +90,10 @@ class AgentOperation(Base):
         nullable=False,
         index=True,
     )
+    # When true, the agent must get human approval before this tool runs.
+    requires_approval: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
     agent: Mapped[Agent] = relationship(back_populates="agent_operations")
     operation: Mapped[Operation] = relationship(back_populates="agent_operations")
@@ -129,5 +134,9 @@ class AgentSystemToolGrant(Base):
         index=True,
     )
     tool_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # When true, the agent must get human approval before this tool runs.
+    requires_approval: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
     agent: Mapped[Agent] = relationship(back_populates="agent_system_tool_grants")

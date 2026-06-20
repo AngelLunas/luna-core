@@ -45,6 +45,10 @@ class RunEventType(str, enum.Enum):
     tool_result = "tool_result"
     human_checkpoint = "human_checkpoint"
     human_response = "human_response"
+    # Human-in-the-loop tool approval (chat). Emitted when a turn suspends
+    # awaiting approval for a tool_use, and when an approval is resolved.
+    tool_approval_required = "tool_approval_required"
+    tool_approval_resolved = "tool_approval_resolved"
     # Per-iteration lifecycle for ai_agent nodes running in scratchpad mode.
     # Emitted once per item the runtime processes (whether sequential or
     # parallel). All `agent_*`, `tool_*` events emitted from inside an
