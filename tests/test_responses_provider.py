@@ -138,18 +138,36 @@ def test_output_bad_function_args_fall_back_to_raw():
     assert blocks[0]["input"] == {"_raw": "not json"}
 
 
-def test_output_reasoning_becomes_thinking_and_websearch_dropped():
+def test_output_reasoning_thinking_and_websearch_kept_in_order():
     resp = SimpleNamespace(
         output=[
             SimpleNamespace(type="reasoning", summary=[SimpleNamespace(text="weighing options")]),
-            SimpleNamespace(type="web_search_call", id="ws_1"),  # server-side, dropped
+            SimpleNamespace(
+                type="web_search_call",
+                id="ws_1",
+                action=SimpleNamespace(
+                    query="powdery mildew cure",
+                    queries=["powdery mildew cure", "neem oil dosage", ""],
+                ),
+            ),
             SimpleNamespace(type="message", content=[_part("answer")]),
         ]
     )
     blocks, thinking = _responses_output_to_blocks(resp)
     assert thinking == "weighing options"
     types = [b["type"] for b in blocks]
-    assert types == ["thinking", "text"]  # web_search_call produced no block
+    # web_search_call is kept in place so it renders in the order it ran.
+    assert types == ["thinking", "web_search_call", "text"]
+    ws = blocks[1]
+    assert ws["id"] == "ws_1"
+    # query + queries deduped, blanks dropped.
+    assert ws["queries"] == ["powdery mildew cure", "neem oil dosage"]
+
+
+def test_output_websearch_without_action_yields_empty_queries():
+    resp = SimpleNamespace(output=[SimpleNamespace(type="web_search_call", id="ws_2")])
+    blocks, _ = _responses_output_to_blocks(resp)
+    assert blocks == [{"type": "web_search_call", "id": "ws_2", "queries": []}]
 
 
 # --- _ResponsesUsage adapter -------------------------------------------------

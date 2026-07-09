@@ -294,8 +294,10 @@ def _responses_output_to_blocks(
     response: Any,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Responses ``output`` items → canonical blocks (+ extracted thinking text).
-    ``web_search_call`` and other server-side tool items are dropped — their
-    results are already folded into the model's message (with url citations)."""
+    ``web_search_call`` items are kept as ``web_search_call`` blocks (in place, so
+    the search renders in the order it ran) carrying the queries the model issued;
+    their textual results are also folded into the model's message (url citations).
+    Other server-side tool items are dropped."""
     blocks: list[dict[str, Any]] = []
     thinking_text: str | None = None
     for item in getattr(response, "output", None) or []:
@@ -336,6 +338,21 @@ def _responses_output_to_blocks(
                     "id": getattr(item, "call_id", None) or getattr(item, "id", None),
                     "name": getattr(item, "name", ""),
                     "input": parsed,
+                }
+            )
+        elif itype == "web_search_call":
+            action = getattr(item, "action", None)
+            queries: list[str] = []
+            for q in [getattr(action, "query", None)] + list(
+                getattr(action, "queries", None) or []
+            ):
+                if isinstance(q, str) and q.strip() and q not in queries:
+                    queries.append(q.strip())
+            blocks.append(
+                {
+                    "type": "web_search_call",
+                    "id": getattr(item, "id", None),
+                    "queries": queries,
                 }
             )
     return blocks, thinking_text
