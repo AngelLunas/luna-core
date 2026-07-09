@@ -31,6 +31,16 @@ class User(Base):
     is_active: Mapped[bool] = mapped_column(
         Boolean, default=True, nullable=False, server_default="true"
     )
+    # Email ownership confirmation. New accounts start False; the gate in
+    # ``get_current_user`` blocks protected routes until this flips True (only
+    # when ``settings.email_verification_required`` — off in luna-core by default,
+    # host apps opt in). See luna_core.services.verification.
+    is_verified: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False, server_default="false"
+    )
+    verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

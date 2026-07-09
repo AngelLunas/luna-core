@@ -55,3 +55,13 @@ def generate_refresh_token() -> str:
 
 def hash_refresh_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def generate_numeric_code(digits: int = 6) -> str:
+    """A zero-padded, uniformly random numeric code (email verification, etc.)."""
+    return f"{secrets.randbelow(10 ** digits):0{digits}d}"
+
+
+def hash_token(value: str) -> str:
+    """SHA-256 hex digest — for at-rest storage of single-use secrets/codes."""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()

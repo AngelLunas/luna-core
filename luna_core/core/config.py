@@ -46,6 +46,16 @@ class Settings(BaseSettings):
     login_rate_limit_attempts: int = 5
     login_rate_limit_window_seconds: int = 300
 
+    # Email verification. Off by default in luna-core (a registered user is
+    # immediately usable); host apps opt in via env or a Settings subclass. When
+    # on, ``get_current_user`` returns 403 ``email_not_verified`` on protected
+    # routes until the user confirms their address.
+    email_verification_required: bool = False
+    # Verification is a short numeric code typed into the app (no link). Brute
+    # force is bounded by the per-code attempt cap plus this short expiry.
+    email_verification_code_ttl_minutes: int = 30
+    email_verification_max_attempts: int = 5
+
     # Celery
     celery_broker_url: str | None = None
     celery_result_backend: str | None = None

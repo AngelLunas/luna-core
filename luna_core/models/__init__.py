@@ -5,6 +5,7 @@ from luna_core.models.conversation import (
     ConversationMessage,
     ConversationMessageRole,
 )
+from luna_core.models.email_verification_code import EmailVerificationCode
 from luna_core.models.embedding import EMBEDDING_DIMENSIONS, Embedding
 from luna_core.models.event import (
     AgentMessage,
@@ -32,6 +33,7 @@ __all__ = [
     "ConversationMessage",
     "ConversationMessageRole",
     "EMBEDDING_DIMENSIONS",
+    "EmailVerificationCode",
     "Embedding",
     "Flow",
     "FlowRun",
