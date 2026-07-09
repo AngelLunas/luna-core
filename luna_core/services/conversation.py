@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from luna_core.models.conversation import Conversation, ConversationMessage
@@ -73,6 +73,19 @@ async def update_conversation_title(
     return conversation
 
 
+async def delete_conversation(
+    db: AsyncSession,
+    conversation_id: uuid.UUID,
+    *,
+    user_id: uuid.UUID | None = None,
+) -> None:
+    """Delete a conversation (ownership-checked). Its messages, tool approvals and
+    routing rows cascade away via their FKs."""
+    conversation = await get_conversation(db, conversation_id, user_id=user_id)
+    await db.delete(conversation)
+    await db.commit()
+
+
 async def list_messages(
     db: AsyncSession,
     conversation_id: uuid.UUID,
@@ -92,3 +105,25 @@ async def list_messages(
     stmt = stmt.order_by(ConversationMessage.sequence)
     result = await db.execute(stmt)
     return list(result.scalars().all())
+
+
+async def finalize_partial_messages(
+    db: AsyncSession, conversation_id: uuid.UUID
+) -> int:
+    """Promote a conversation's partial assistant rows to final (is_partial=False).
+
+    Used when a turn is aborted: the text streamed-so-far was persisted as a
+    partial, but the user chose to stop there, so that text IS the turn's final
+    content and must show in the thread (``list_messages`` hides partials).
+    Returns how many rows were promoted.
+    """
+    result = await db.execute(
+        update(ConversationMessage)
+        .where(
+            ConversationMessage.conversation_id == conversation_id,
+            ConversationMessage.is_partial.is_(True),
+        )
+        .values(is_partial=False)
+    )
+    await db.commit()
+    return result.rowcount or 0

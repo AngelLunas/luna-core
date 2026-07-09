@@ -46,6 +46,12 @@ class RunEventType(str, enum.Enum):
     # run_events), like the *_delta events — so the UI can show "searching the
     # web…" without a DB enum value.
     builtin_tool_call = "builtin_tool_call"
+    # A conversation was auto-titled after its first turn. Pub/sub-only (never
+    # persisted to run_events), like the *_delta events — a fire-and-forget host
+    # task generates the title off the critical path and publishes it on the
+    # conversation channel so an open chat updates its header/list live. Payload:
+    # ``{conversation_id, title}``.
+    conversation_titled = "conversation_titled"
     tool_called = "tool_called"
     tool_result = "tool_result"
     human_checkpoint = "human_checkpoint"

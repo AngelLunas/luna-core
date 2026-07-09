@@ -16,22 +16,28 @@ orchestrator just returns it); the metering hook, if set, runs after each turn.
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request, WebSocket, status
+import jwt
+from fastapi import APIRouter, HTTPException, Request, Response, WebSocket, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from luna_core.core.db import AsyncSessionLocal
 from luna_core.core.dependencies import (
     CurrentUser,
     DBSession,
     RedisClient,
     get_redis_client,
 )
+from luna_core.core.config import settings
+from luna_core.core.security import decode_access_token
 from luna_core.engine.agent import SuspendedForApproval
 from luna_core.engine.chat import ChatRunner
+from luna_core.llm.base import AbortSignalError, abort_key
 from luna_core.engine.websocket import WebSocketManager
 from luna_core.models.agent import Agent
 from luna_core.models.conversation import Conversation
@@ -45,9 +51,12 @@ from luna_core.schemas.conversation import (
     SendMessageResponse,
 )
 from luna_core.schemas.tool_approval import ToolApprovalDecision, ToolApprovalRead
+from luna_core.services.auto_title import maybe_title_conversation
 from luna_core.services.conversation import (
     ConversationNotFound,
     create_conversation,
+    delete_conversation,
+    finalize_partial_messages,
     get_conversation,
     list_conversations,
     list_messages,
@@ -72,6 +81,45 @@ AgentResolver = Callable[[AsyncSession, Conversation], Awaitable[Agent]]
 # misbehaving pair of agents can't ping-pong forever. A single-agent host never
 # trips this — the resolver returns the same agent and the loop exits at once.
 MAX_HANDOFF_HOPS = 4
+
+# Fire-and-forget auto-title tasks. Kept in a module-level set so the event loop
+# doesn't garbage-collect a task mid-flight (asyncio holds only a weak ref); each
+# discards itself on completion.
+_auto_title_tasks: set[asyncio.Task] = set()
+
+
+def _maybe_spawn_auto_title(
+    request: Request,
+    conversation_id: uuid.UUID,
+    owner_id: uuid.UUID | None,
+    agent: Agent,
+    response: SendMessageResponse,
+    needs_title: bool,
+) -> None:
+    """After a completed turn, kick off titling OFF the request path.
+
+    Opt-in: only runs when the host set ``app.state.chat_auto_title_llm_router``
+    (an ``LLMRouter``) — hosts that don't stay unaffected. Skips owner-less
+    conversations (domain-owned) and any turn that didn't finish cleanly.
+    ``needs_title`` is the pre-turn snapshot of ``conversation.title is None`` so
+    we don't even spawn on later turns; the task itself re-checks idempotently."""
+    if not needs_title or owner_id is None or response.status != "completed":
+        return
+    llm_router = getattr(request.app.state, "chat_auto_title_llm_router", None)
+    if llm_router is None:
+        return
+    task = asyncio.create_task(
+        maybe_title_conversation(
+            conversation_id=conversation_id,
+            user_id=owner_id,
+            llm_router=llm_router,
+            redis=get_redis_client(),
+            provider_id=agent.llm_provider_id,
+            model=agent.model,
+        )
+    )
+    _auto_title_tasks.add(task)
+    task.add_done_callback(_auto_title_tasks.discard)
 
 
 @dataclass
@@ -126,6 +174,33 @@ async def update(
     return ConversationRead.model_validate(conversation)
 
 
+@router.delete("/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete(
+    conversation_id: uuid.UUID,
+    request: Request,
+    db: DBSession,
+    redis: RedisClient,
+    user: CurrentUser,
+) -> Response:
+    """Delete a conversation and all its history (cascades). Owner-only.
+
+    If the host registered ``app.state.on_conversation_delete``, it runs first —
+    while the messages still exist — so the host can clean up side artifacts (e.g.
+    images the chat uploaded) before the cascade removes the rows that point to them.
+    """
+    try:
+        await _get_owned(db, conversation_id, user.id)
+        hook = getattr(request.app.state, "on_conversation_delete", None)
+        if hook is not None:
+            await hook(db, conversation_id, user.id)
+        await delete_conversation(db, conversation_id, user_id=user.id)
+    except ConversationNotFound as exc:
+        raise _not_found(conversation_id) from exc
+    # Drop any lingering abort flag for this id so it can't leak to a reused key.
+    await redis.delete(abort_key(conversation_id))
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.get(
     "/{conversation_id}/messages", response_model=list[ConversationMessageRead]
 )
@@ -153,6 +228,9 @@ async def send(
     stream on the ``/stream`` WebSocket; this call returns the final output, or
     ``awaiting_approval`` when the turn paused for human tool approval."""
     conversation = await _get_owned(db, conversation_id, user.id)
+    # Snapshot now (pre-turn), while the row is fresh: whether this conversation
+    # still needs an auto-title. Used after the turn to titling off the hot path.
+    needs_title = conversation.title is None
     if await count_pending(db, conversation_id) > 0:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -162,26 +240,64 @@ async def send(
     resolver = _agent_resolver(request)
     agent = await resolver(db, conversation)
 
+    # Clear any stale abort flag from a prior turn (the key lingers for its TTL
+    # and is never auto-cleared) so it can't kill this fresh turn.
+    await redis.delete(abort_key(conversation_id))
+
     attachments = [
         {"type": "image", "media_id": str(mid)} for mid in payload.media_ids
     ] or None
-    result = await runner.send(
-        agent=agent,
-        conversation_id=conversation_id,
-        new_message=payload.new_message,
-        db=db,
-        redis=redis,
-        system_prompt=await _augment_system_prompt(
-            request, db, conversation, agent, payload.new_message
-        ),
-        extra_call_context={"user_id": str(user.id)},
-        attachments=attachments,
+    try:
+        result = await runner.send(
+            agent=agent,
+            conversation_id=conversation_id,
+            new_message=payload.new_message,
+            db=db,
+            redis=redis,
+            system_prompt=await _augment_system_prompt(
+                request, db, conversation, agent, payload.new_message
+            ),
+            extra_call_context={"user_id": str(user.id)},
+            attachments=attachments,
+            image_resolver=await _image_resolver(
+                request, db, conversation, agent, user.id
+            ),
+        )
+        agent, result = await _follow_handoffs(
+            db, request, conversation, redis, user.id, agent, result,
+            query=payload.new_message,
+        )
+    except AbortSignalError:
+        # The user stopped the turn. The provider persisted the streamed-so-far
+        # text as a PARTIAL message; promote it to final so it stays in the thread
+        # (list_messages hides partials). Clear the flag for the next turn.
+        await redis.delete(abort_key(conversation_id))
+        await finalize_partial_messages(db, conversation_id)
+        return SendMessageResponse(conversation_id=conversation_id, status="aborted")
+    response = await _turn_response(db, request, conversation_id, agent, user.id, result)
+    _maybe_spawn_auto_title(
+        request, conversation_id, conversation.user_id, agent, response, needs_title
     )
-    agent, result = await _follow_handoffs(
-        db, request, conversation, redis, user.id, agent, result,
-        query=payload.new_message,
+    return response
+
+
+@router.post("/{conversation_id}/abort", status_code=status.HTTP_202_ACCEPTED)
+async def abort_turn(
+    conversation_id: uuid.UUID,
+    db: DBSession,
+    redis: RedisClient,
+    user: CurrentUser,
+) -> dict[str, str]:
+    """Stop the conversation's in-flight turn. Sets the abort flag the streaming
+    provider checks before each chunk: it stops reading the LLM stream (no more
+    tokens burned), persists whatever streamed as a partial message, and the
+    blocking ``/messages`` call returns ``status="aborted"``. A no-op if nothing
+    is running."""
+    await _get_owned(db, conversation_id, user.id)
+    await redis.set(
+        abort_key(conversation_id), "1", ex=settings.run_abort_key_ttl_seconds
     )
-    return await _turn_response(db, request, conversation_id, agent, user.id, result)
+    return {"status": "aborting"}
 
 
 @router.get(
@@ -219,6 +335,7 @@ async def decide_tool_approval(
     the turn is resolved, the turn resumes in-request: the decided tools run and
     the LLM is re-invoked (unless the whole turn was rejected with no reason)."""
     conversation = await _get_owned(db, conversation_id, user.id)
+    needs_title = conversation.title is None  # pre-resume snapshot (see send())
     approval = await get_approval(db, approval_id)
     if approval.conversation_id != conversation_id:
         raise _approval_not_found(approval_id)
@@ -260,11 +377,18 @@ async def decide_tool_approval(
         redis=redis,
         system_prompt=agent.instructions or None,
         extra_call_context={"user_id": str(user.id)},
+        image_resolver=await _image_resolver(
+            request, db, conversation, agent, user.id
+        ),
     )
     agent, result = await _follow_handoffs(
         db, request, conversation, redis, user.id, agent, result
     )
-    return await _turn_response(db, request, conversation_id, agent, user.id, result)
+    response = await _turn_response(db, request, conversation_id, agent, user.id, result)
+    _maybe_spawn_auto_title(
+        request, conversation_id, conversation.user_id, agent, response, needs_title
+    )
+    return response
 
 
 # --- live stream ---
@@ -282,8 +406,40 @@ def get_ws_manager() -> WebSocketManager:
     return _ws_manager
 
 
+def _user_from_token(token: str | None) -> uuid.UUID | None:
+    """Decode an access token (passed as a WS query param, since browsers can't
+    set WebSocket headers) → the user id, or None if missing/invalid/expired."""
+    if not token:
+        return None
+    try:
+        payload = decode_access_token(token)
+    except jwt.InvalidTokenError:  # covers expired (ExpiredSignatureError subclass)
+        return None
+    sub = payload.get("sub")
+    try:
+        return uuid.UUID(sub) if sub else None
+    except (ValueError, TypeError):
+        return None
+
+
 @router.websocket("/{conversation_id}/stream")
-async def stream(websocket: WebSocket, conversation_id: uuid.UUID) -> None:
+async def stream(
+    websocket: WebSocket,
+    conversation_id: uuid.UUID,
+    token: str | None = None,
+) -> None:
+    # Authenticate the socket: a valid access token whose user owns this
+    # conversation. Reject before accepting otherwise (the stream is per-user).
+    user_id = _user_from_token(token)
+    if user_id is None:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+    async with AsyncSessionLocal() as db:
+        try:
+            await get_conversation(db, conversation_id, user_id=user_id)
+        except ConversationNotFound:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
     await get_ws_manager().connect(conversation_id, websocket)
 
 
@@ -351,6 +507,9 @@ async def _follow_handoffs(
                 request, db, conversation, agent, query
             ),
             extra_call_context={"user_id": str(user_id)},
+            image_resolver=await _image_resolver(
+                request, db, conversation, agent, user_id
+            ),
         )
         hops += 1
     return agent, result
@@ -413,6 +572,24 @@ def _not_found(conversation_id: uuid.UUID) -> HTTPException:
         status_code=status.HTTP_404_NOT_FOUND,
         detail=f"conversation {conversation_id} not found",
     )
+
+
+async def _image_resolver(
+    request: Request,
+    db: AsyncSession,
+    conversation: Conversation,
+    agent: Agent,
+    user_id: uuid.UUID,
+) -> Any | None:
+    """Per-agent image resolver from the optional host hook
+    ``app.state.chat_image_resolver_factory``. The host decides whether THIS agent
+    should see attached photos inline (vision-capable models) and how to scope them
+    (e.g. only the latest turn's); a text-only agent gets ``None`` and keeps reading
+    the ``[image attached: …]`` notes. No hook ⇒ ``None`` ⇒ unchanged behaviour."""
+    factory = getattr(request.app.state, "chat_image_resolver_factory", None)
+    if factory is None:
+        return None
+    return await factory(db, user_id, agent, conversation)
 
 
 def _chat_runner(request: Request) -> ChatRunner:
