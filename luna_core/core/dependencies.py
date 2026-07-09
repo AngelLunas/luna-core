@@ -7,6 +7,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from luna_core.core.config import settings
 from luna_core.core.db import get_db
 from luna_core.core.redis import get_redis
 from luna_core.core.security import decode_access_token
@@ -29,10 +30,13 @@ def get_redis_client() -> Redis:
     return get_redis()
 
 
-async def get_current_user(
+async def get_current_user_allow_unverified(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> User:
+    """Authenticate the bearer token and load the user — WITHOUT the email-
+    verification gate. Use for the handful of endpoints an unverified user must
+    still reach (read own profile, re-send verification, log out)."""
     if credentials is None or credentials.scheme.lower() != "bearer":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -80,7 +84,24 @@ async def get_current_user(
     return user
 
 
+async def get_current_user(
+    user: Annotated[User, Depends(get_current_user_allow_unverified)],
+) -> User:
+    """The default protected-route principal: authenticated AND (when the host
+    app requires it) email-verified. Unverified users get 403 ``email_not_verified``
+    so the client can route them to the "confirm your email" screen."""
+    if settings.email_verification_required and not user.is_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="email_not_verified",
+        )
+    return user
+
+
 CurrentUser = Annotated[User, Depends(get_current_user)]
+CurrentUserAllowUnverified = Annotated[
+    User, Depends(get_current_user_allow_unverified)
+]
 DBSession = Annotated[AsyncSession, Depends(get_db)]
 RedisClient = Annotated[Redis, Depends(get_redis_client)]
 

@@ -41,10 +41,25 @@ class RunEventType(str, enum.Enum):
     agent_text_delta = "agent_text_delta"
     agent_thinking_delta = "agent_thinking_delta"
     agent_message_completed = "agent_message_completed"
+    # Built-in (provider-side) tool activity surfaced live, e.g. the Responses API
+    # running a web_search mid-turn. Transient + pub/sub-only (never persisted to
+    # run_events), like the *_delta events — so the UI can show "searching the
+    # web…" without a DB enum value.
+    builtin_tool_call = "builtin_tool_call"
+    # A conversation was auto-titled after its first turn. Pub/sub-only (never
+    # persisted to run_events), like the *_delta events — a fire-and-forget host
+    # task generates the title off the critical path and publishes it on the
+    # conversation channel so an open chat updates its header/list live. Payload:
+    # ``{conversation_id, title}``.
+    conversation_titled = "conversation_titled"
     tool_called = "tool_called"
     tool_result = "tool_result"
     human_checkpoint = "human_checkpoint"
     human_response = "human_response"
+    # Human-in-the-loop tool approval (chat). Emitted when a turn suspends
+    # awaiting approval for a tool_use, and when an approval is resolved.
+    tool_approval_required = "tool_approval_required"
+    tool_approval_resolved = "tool_approval_resolved"
     # Per-iteration lifecycle for ai_agent nodes running in scratchpad mode.
     # Emitted once per item the runtime processes (whether sequential or
     # parallel). All `agent_*`, `tool_*` events emitted from inside an

@@ -6,10 +6,18 @@ that needs persistent user-agent chat (sentinel cover letters today,
 debug threads tomorrow) holds an FK to ``Conversation.id`` instead of
 embedding messages itself.
 
-The shape is naked on purpose: no FK back to agents or runs. The
-owning domain table is the one that knows what the conversation is
-*about*. Keeping that out of core lets the same primitive serve every
-future agent without dragging domain entities into the engine.
+The shape stays deliberately lean: **no FK back to agents or runs**, and no
+domain knowledge — the owning domain table is the one that knows what the
+conversation is *about*, which lets the same primitive serve every future
+agent without dragging domain entities into the engine.
+
+The one non-domain anchor it does carry is an **optional owner** (``user_id``
+→ the core ``User``) so host apps that expose conversations directly over an
+API can scope/list them per user without inventing a parallel table. It is
+**nullable**: a conversation owned by a domain row (sentinel's cover letters)
+simply leaves it null. ``title`` is an optional human label. Neither couples
+the engine to a domain — ``User`` is a core entity and ownership is generic
+multi-tenancy, not "what the conversation is about".
 
 ``ConversationMessage.content`` mirrors the JSONB array-of-blocks shape
 ``AgentMessage.content`` already uses (text + tool_use + tool_result),
@@ -28,6 +36,7 @@ from sqlalchemy import (
     Enum,
     ForeignKey,
     Index,
+    String,
     UniqueConstraint,
     func,
 )
@@ -50,6 +59,14 @@ class Conversation(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
+    # Optional owner — nullable so a domain-owned conversation leaves it null.
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("core.users.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

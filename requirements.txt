@@ -18,7 +18,7 @@ httpx==0.28.1
 cryptography==44.0.0
 croniter==3.0.4
 websockets==14.1
-openai==1.59.6
+openai==1.109.1
 anthropic==0.42.0
 fastmcp==2.3.0
 jsonschema==4.23.0

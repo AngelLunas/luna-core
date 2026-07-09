@@ -200,7 +200,7 @@ class FlowRunner:
         # continuing so reconstructed agent context sees the approval inline.
         emitter = EventEmitter(db, redis, flow_run_id)
         current_node = (run.state or {}).get("current_node") or "human_checkpoint"
-        await emitter.save_agent_message(
+        await emitter.save_message(
             node_id=current_node,
             role=AgentMessageRole.user,
             content=[{"type": "text", "text": human_response}],

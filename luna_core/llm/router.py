@@ -17,8 +17,9 @@ import uuid
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from openai import APIError
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,6 +34,9 @@ from luna_core.llm.base import (
 from luna_core.llm.providers.generic import GenericProvider
 from luna_core.models.llm_provider import LLMProvider
 from luna_core.services.llm_provider import get_decrypted_api_key
+
+if TYPE_CHECKING:
+    from luna_core.engine.streaming import IOFactory
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +124,9 @@ class LLMRouter:
         output_schema: dict[str, Any] | None,
         run_id: uuid.UUID,
         node_id: str,
+        make_io: IOFactory | None = None,
+        image_resolver: Callable[[str], Any] | None = None,
+        builtin_tools: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         attempt = 0
         last_exc: Exception | None = None
@@ -137,6 +144,9 @@ class LLMRouter:
                     run_id=run_id,
                     node_id=node_id,
                     redis=self._redis,
+                    make_io=make_io,
+                    image_resolver=image_resolver,
+                    builtin_tools=builtin_tools,
                 )
             except AbortSignalError:
                 raise
@@ -149,6 +159,29 @@ class LLMRouter:
                 logger.warning(
                     "rate-limited by provider %s (attempt %d/%d); sleeping %.2fs",
                     provider_id,
+                    attempt,
+                    self._max_retries,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+            except APIError as exc:
+                # Transient provider/server failure — a 5xx, a connection/timeout,
+                # or an error object a gateway (e.g. OpenRouter) streams *inside* a
+                # 200 response, which the SDK surfaces as a bare APIError mid-stream.
+                # 4xx client errors are NOT retried — they won't fix on retry.
+                status = getattr(exc, "status_code", None)
+                if status is not None and status < 500:
+                    raise
+                last_exc = exc
+                attempt += 1
+                if attempt > self._max_retries:
+                    break
+                delay = self._backoff_delay(attempt)
+                logger.warning(
+                    "transient LLM error from provider %s (status=%s, attempt %d/%d); "
+                    "sleeping %.2fs",
+                    provider_id,
+                    status,
                     attempt,
                     self._max_retries,
                     delay,

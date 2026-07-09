@@ -166,6 +166,19 @@ class EventEmitter:
     def flow_run_id(self) -> uuid.UUID:
         return self._flow_run_id
 
+    @property
+    def scope_id(self) -> uuid.UUID:
+        """Satisfies ``streaming.EventSink.scope_id``. For the flow
+        implementation the execution scope *is* the flow run."""
+        return self._flow_run_id
+
+    def for_session(self, db: AsyncSession) -> "EventEmitter":
+        """Satisfies ``streaming.AgentIO.for_session``: a sibling bound to
+        ``db`` with the same redis + flow run. Lets the streaming provider
+        persist on its own short-lived sessions without referencing this
+        concrete class."""
+        return EventEmitter(db, self._redis, self._flow_run_id)
+
     async def _next_event_sequence(self) -> int:
         current = await self._db.execute(
             select(func.coalesce(func.max(RunEvent.sequence), 0)).where(
@@ -264,7 +277,7 @@ class EventEmitter:
         await _bump_max_seq(self._redis, self._flow_run_id, event.sequence)
         return event
 
-    async def save_agent_message(
+    async def save_message(
         self,
         node_id: str,
         role: AgentMessageRole,
@@ -317,3 +330,8 @@ class EventEmitter:
             raise last_error
         assert message is not None  # set on the successful break
         return message
+
+    # Back-compat alias for external hosts (and tests) still calling the
+    # flow-named method. ``save_message`` is the canonical name declared on
+    # ``streaming.TranscriptStore``; both names are the same coroutine.
+    save_agent_message = save_message
