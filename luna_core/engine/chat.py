@@ -209,6 +209,7 @@ class ChatRunner:
         system_prompt: str | None = None,
         extra_call_context: dict[str, Any] | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        image_resolver: Any | None = None,
     ) -> dict[str, Any] | str | SuspendedForApproval:
         """Run one assistant turn: stream deltas + lifecycle events on the
         conversation's channel, persist the turn as ``ConversationMessage``
@@ -237,6 +238,7 @@ class ChatRunner:
             extra_call_context=extra_call_context,
             approval_enabled=True,
             attachments=attachments,
+            image_resolver=image_resolver,
         )
 
     async def resume(
@@ -248,6 +250,7 @@ class ChatRunner:
         redis: Redis,
         system_prompt: str | None = None,
         extra_call_context: dict[str, Any] | None = None,
+        image_resolver: Any | None = None,
     ) -> dict[str, Any] | str | SuspendedForApproval:
         """Resume a turn suspended for tool approval. Loads the history (ending
         with the assistant message holding the gated ``tool_use`` blocks) and
@@ -265,6 +268,7 @@ class ChatRunner:
             redis=redis,
             system_prompt=system_prompt,
             extra_call_context=extra_call_context,
+            image_resolver=image_resolver,
         )
 
     async def _load_history(

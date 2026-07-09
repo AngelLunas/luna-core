@@ -487,6 +487,7 @@ class AgentRunner:
         system_prompt: str | None = None,
         context_tool_names: list[str] | None = None,
         extra_call_context: dict[str, Any] | None = None,
+        image_resolver: Any | None = None,
     ) -> dict[str, Any] | str | SuspendedForApproval:
         """Resume a turn that suspended for approval.
 
@@ -569,6 +570,7 @@ class AgentRunner:
             context_tool_names=context_tool_names,
             extra_call_context=extra_call_context,
             approval_enabled=True,
+            image_resolver=image_resolver,
         )
 
     # ------------------------------------------------------------------ helpers
