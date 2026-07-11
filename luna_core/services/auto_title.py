@@ -42,6 +42,37 @@ logger = logging.getLogger(__name__)
 _MAX_TITLE_CHARS = 60
 _FALLBACK_CHARS = 48
 
+
+class _NullIO:
+    """``streaming.AgentIO`` that discards everything.
+
+    The titling completion is a throwaway one-shot: its lifecycle events and
+    "transcript" (the title text) have no audience and must not be persisted.
+    Passing ``make_io=None`` to the provider is NOT that — the provider then
+    defaults to the flow ``EventEmitter``, which writes ``run_events`` /
+    ``agent_messages`` rows keyed by our fresh ``run_id`` and violates the
+    ``flow_run_id`` FK (no such flow run exists). So we hand it this explicit
+    black hole instead."""
+
+    def __init__(self, scope_id: uuid.UUID) -> None:
+        self._scope_id = scope_id
+
+    @property
+    def scope_id(self) -> uuid.UUID:
+        return self._scope_id
+
+    def for_session(self, _db: Any) -> "_NullIO":
+        return self
+
+    async def emit(self, _event_type: Any, node_id: Any = None, payload: Any = None):
+        class _Seq:
+            sequence = 0
+
+        return _Seq()
+
+    async def save_message(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
 _TITLE_SYSTEM = (
     "You name chat conversations. Given the user's first message, reply with a "
     "concise title of 3 to 6 words that captures the topic. Use the user's own "
@@ -83,6 +114,7 @@ async def _generate_title(
     """One non-streaming completion on the given provider/model. Returns the
     model's text, or ``None`` on any failure (caller falls back)."""
     try:
+        run_id = uuid.uuid4()  # fresh scope: no abort/rate-limit key clash with the turn
         blocks = await llm_router.complete(
             provider_id=provider_id,
             messages=[
@@ -93,9 +125,9 @@ async def _generate_title(
             temperature=0.0,
             model=model,
             output_schema=None,
-            run_id=uuid.uuid4(),  # fresh scope: no abort/rate-limit key clash with the turn
+            run_id=run_id,
             node_id="title",
-            make_io=None,  # non-streaming — nothing to fan out
+            make_io=lambda _db: _NullIO(run_id),  # throwaway one-shot — persist nothing
         )
     except Exception:  # noqa: BLE001 — titling must never break anything
         logger.exception("auto-title completion failed")
