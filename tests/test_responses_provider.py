@@ -95,8 +95,9 @@ def test_input_image_resolved_vs_note():
     items = _canonical_to_responses_input(messages, {"seen": "data:image/png;base64,X"})
     parts = items[0]["content"]
     assert {"type": "input_image", "image_url": "data:image/png;base64,X"} in parts
-    note = next(p for p in parts if p["type"] == "input_text")
-    assert "media_id=unseen" in note["text"]
+    notes = [p["text"] for p in parts if p["type"] == "input_text"]
+    assert "[image attached: img-1 (shown below)]" in notes  # the rendered one
+    assert "[image attached: img-2]" in notes  # the unresolved one, label only
 
 
 # --- _responses_output_to_blocks --------------------------------------------

@@ -92,14 +92,21 @@ def _canonical_to_openai_messages(
     ``image_urls`` maps ``media_id`` → a renderable URL (typically a ``data:``
     base64 URL). When supplied and an attached image resolves, that user turn is
     emitted as an OpenAI multimodal ``content`` parts list (text + ``image_url``)
-    so a vision model sees the pixels; unresolved images (and the no-map case)
-    fall back to the ``[image attached: media_id=…]`` text note a text model can
-    still pass to a tool.
+    so a vision model sees the pixels.
+
+    Every attached image is numbered ``img-N`` in order of appearance across the
+    conversation's user turns — the same order a host derives from its stored
+    messages — so tools can resolve the label back to the media row. The note is
+    ``[image attached: img-N (shown below)]`` for a rendered image and
+    ``[image attached: img-N]`` for one the model can't see (text model, or an
+    unresolved media). Raw media UUIDs are never shown: models copy them with
+    hallucinated digits.
     """
     result: list[dict[str, Any]] = []
     if system:
         result.append({"role": "system", "content": system})
 
+    image_seq = 0  # conversation-wide img-N counter (order of appearance)
     for msg in messages:
         role = msg.get("role")
         content = msg.get("content", [])
@@ -120,38 +127,44 @@ def _canonical_to_openai_messages(
                         }
                     )
             if text_blocks or image_blocks:
-                resolved = [
-                    (b, (image_urls or {}).get(str(b.get("media_id"))))
-                    for b in image_blocks
-                ]
-                rendered = [(b, url) for b, url in resolved if url]
+                labeled: list[tuple[str, str | None]] = []
+                for b in image_blocks:
+                    image_seq += 1
+                    labeled.append(
+                        (
+                            f"img-{image_seq}",
+                            (image_urls or {}).get(str(b.get("media_id"))),
+                        )
+                    )
+                rendered_urls = [url for _label, url in labeled if url]
                 joined_text = "\n".join(
                     b.get("text", "") for b in text_blocks if b.get("text")
                 )
-                if rendered:
-                    # Vision path: emit a multimodal content parts list. Any
-                    # image we could NOT resolve still rides as a text note.
+                if rendered_urls:
+                    # Vision path: emit a multimodal content parts list. Every
+                    # image keeps its label note; one we could NOT resolve
+                    # rides as a plain note (no pixels).
                     note = "\n".join(
-                        f"[image attached: media_id={b.get('media_id')}]"
-                        for b, url in resolved
-                        if not url
+                        f"[image attached: {label} (shown below)]"
+                        if url
+                        else f"[image attached: {label}]"
+                        for label, url in labeled
                     )
                     full_text = "\n".join(t for t in (joined_text, note) if t)
                     parts: list[dict[str, Any]] = []
                     if full_text:
                         parts.append({"type": "text", "text": full_text})
-                    for _b, url in rendered:
+                    for url in rendered_urls:
                         parts.append(
                             {"type": "image_url", "image_url": {"url": url}}
                         )
                     result.append({"role": "user", "content": parts})
                 else:
-                    # Text path: render each attached media as a text note so a
-                    # text model knows a media is present and can pass its id to
-                    # a tool.
+                    # Text path: render each attached media as its label note
+                    # so the model knows a photo is present and can reference
+                    # it by label in a tool call.
                     notes = [
-                        f"[image attached: media_id={b.get('media_id')}]"
-                        for b in image_blocks
+                        f"[image attached: {label}]" for label, _url in labeled
                     ]
                     text = "\n".join(
                         p for p in [joined_text, *notes] if p
@@ -228,8 +241,15 @@ def _canonical_to_responses_input(
 ) -> list[dict[str, Any]]:
     """Canonical history → Responses ``input`` items. tool_use/tool_result become
     top-level ``function_call`` / ``function_call_output`` items (the API tolerates
-    a historical call for a tool not in the current set, so no special-casing)."""
+    a historical call for a tool not in the current set, so no special-casing).
+
+    Attached images carry the same ``img-N`` labels as the chat-completions
+    translation (numbered in order of appearance across user turns): a rendered
+    image gets an ``[image attached: img-N (shown below)]`` note ahead of its
+    ``input_image`` part; an unresolved one rides as ``[image attached: img-N]``.
+    """
     items: list[dict[str, Any]] = []
+    image_seq = 0  # conversation-wide img-N counter (order of appearance)
     for msg in messages:
         role = msg.get("role")
         content = msg.get("content", []) or []
@@ -251,14 +271,22 @@ def _canonical_to_responses_input(
                 if b.get("type") == "text" and b.get("text"):
                     parts.append({"type": "input_text", "text": b["text"]})
                 elif b.get("type") == "image":
+                    image_seq += 1
+                    label = f"img-{image_seq}"
                     url = (image_urls or {}).get(str(b.get("media_id")))
                     if url:
+                        parts.append(
+                            {
+                                "type": "input_text",
+                                "text": f"[image attached: {label} (shown below)]",
+                            }
+                        )
                         parts.append({"type": "input_image", "image_url": url})
                     else:
                         parts.append(
                             {
                                 "type": "input_text",
-                                "text": f"[image attached: media_id={b.get('media_id')}]",
+                                "text": f"[image attached: {label}]",
                             }
                         )
             if parts:
