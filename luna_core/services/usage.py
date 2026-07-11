@@ -52,6 +52,37 @@ async def record_usage(
     return row
 
 
+async def record_usage_counts(
+    db: AsyncSession,
+    *,
+    scope_id: uuid.UUID,
+    message_id: uuid.UUID | None,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    total_tokens: int,
+    cached_input_tokens: int | None = None,
+    audio_input_tokens: int | None = None,
+) -> LLMUsage:
+    """Persist one usage row from explicit counts — for sources whose usage
+    payload is not OpenAI-chat-shaped (e.g. the Realtime transcription API).
+    Voice STT sessions have no run/conversation, so their ``scope_id`` is the
+    authenticated user id. Does NOT commit — the caller batches the session's
+    rows and commits once."""
+    row = LLMUsage(
+        scope_id=scope_id,
+        message_id=message_id,
+        model=model,
+        input_tokens=_int(input_tokens),
+        output_tokens=_int(output_tokens),
+        cached_input_tokens=cached_input_tokens,
+        audio_input_tokens=audio_input_tokens,
+        total_tokens=_int(total_tokens),
+    )
+    db.add(row)
+    return row
+
+
 async def usage_totals_for_scope(
     db: AsyncSession, scope_id: uuid.UUID
 ) -> dict[str, int]:

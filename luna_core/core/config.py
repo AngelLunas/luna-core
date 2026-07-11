@@ -98,6 +98,24 @@ class Settings(BaseSettings):
     embedding_model: str = "mxbai-embed-large"
     embedding_dimensions: int = 1024
 
+    # Realtime voice transcription (the generic /voice/transcribe WS proxy).
+    # The API key comes from the LLMProvider row named `voice_stt_provider_name`
+    # (hosts seed it — e.g. savia's `openai` row); model + realtime URL are
+    # luna-core policy, never client-settable. Deriving the wss URL from the
+    # provider's base_url is deliberately avoided: the realtime endpoint is not
+    # part of the OpenAI-compatible REST surface that base_url promises.
+    voice_stt_provider_name: str = "openai"
+    voice_stt_model: str = "gpt-4o-mini-transcribe"
+    voice_stt_realtime_url: str = (
+        "wss://api.openai.com/v1/realtime?intent=transcription"
+    )
+    voice_stt_max_session_seconds: int = 120
+    voice_stt_idle_timeout_seconds: int = 15
+    voice_stt_start_timeout_seconds: int = 10
+    # Upper bound on the post-stop grace period; the session closes as soon
+    # as the in-flight turn's final lands (immediately if nothing is pending).
+    voice_stt_finalize_timeout_seconds: float = 10.0
+
     # MCP Server
     mcp_server_url: str = "http://localhost:8765"
 

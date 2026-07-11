@@ -9,6 +9,7 @@ from luna_core.routers import (
     runs,
     system_tools,
     users,
+    voice,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "runs",
     "system_tools",
     "users",
+    "voice",
 ]

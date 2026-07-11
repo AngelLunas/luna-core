@@ -49,6 +49,23 @@ def decode_access_token(token: str) -> dict[str, Any]:
     )
 
 
+def user_id_from_ws_token(token: str | None) -> uuid.UUID | None:
+    """Resolve the user id from an access token passed as a WebSocket query
+    param (browsers can't set WS headers). None on any failure — the caller
+    decides how to reject the socket."""
+    if not token:
+        return None
+    try:
+        payload = decode_access_token(token)
+    except jwt.InvalidTokenError:
+        return None
+    sub = payload.get("sub")
+    try:
+        return uuid.UUID(sub) if sub else None
+    except (ValueError, TypeError):
+        return None
+
+
 def generate_refresh_token() -> str:
     return secrets.token_urlsafe(48)
 

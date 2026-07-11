@@ -42,6 +42,10 @@ class LLMUsage(Base):
     output_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     # Cached/prompt-cache read tokens, when the provider reports them.
     cached_input_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Audio input tokens (subset of input_tokens), when the provider reports
+    # them — audio and text tokens are priced differently, so cost math needs
+    # the split. Populated by audio features (voice STT, audio-input chat).
+    audio_input_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     total_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

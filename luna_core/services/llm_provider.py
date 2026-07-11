@@ -89,6 +89,16 @@ async def get_llm_provider(
     return provider
 
 
+async def get_llm_provider_by_name(db: AsyncSession, name: str) -> LLMProvider:
+    """Lookup by the unique provider name — for features whose provider is
+    chosen by settings (e.g. voice STT) rather than a stored FK."""
+    result = await db.execute(select(LLMProvider).where(LLMProvider.name == name))
+    provider = result.scalar_one_or_none()
+    if provider is None:
+        raise LLMProviderNotFound(name)
+    return provider
+
+
 async def update_llm_provider(
     db: AsyncSession,
     provider_id: uuid.UUID,
