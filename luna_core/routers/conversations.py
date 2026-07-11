@@ -454,14 +454,15 @@ async def _augment_system_prompt(
     """Build the turn's system prompt, optionally enriched by a host RAG hook.
 
     If the host registered ``app.state.chat_context_provider`` — an async
-    ``(db, conversation, agent, query) -> str | None`` — its returned text is
-    appended to the agent's instructions for this turn, so retrieved context
-    (e.g. the user's relevant past cases) is injected automatically rather than
-    relying on the model to call a search tool. Hosts without the hook are
-    unaffected; failures never break the turn."""
+    ``(db, conversation, agent, query) -> str | None`` — it is consulted on every
+    turn (``query`` is ``None`` when the turn has no new user text, e.g. a handoff
+    or image-only turn) and its returned text is appended to the agent's
+    instructions, so context (the current date/time, the user's relevant past
+    cases, …) is injected automatically rather than relying on the model to call a
+    tool. Hosts without the hook are unaffected; failures never break the turn."""
     base = agent.instructions or None
     provider = getattr(request.app.state, "chat_context_provider", None)
-    if provider is None or not query:
+    if provider is None:
         return base
     try:
         extra = await provider(db, conversation, agent, query)
