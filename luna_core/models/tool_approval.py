@@ -57,6 +57,11 @@ class ToolApproval(Base):
     )
     tool_use_id: Mapped[str] = mapped_column(String(255), nullable=False)
     tool_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Canonical name of the agent that proposed the call, so a client can say
+    # who is asking. Stored, not a foreign key: this is a record of what
+    # happened, and it should stay readable if that agent is later retired.
+    # NULL on rows written before agents were told apart.
+    agent_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     tool_input: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     # pending / approved / rejected (stored as text; values from ToolApprovalStatus).
     status: Mapped[str] = mapped_column(

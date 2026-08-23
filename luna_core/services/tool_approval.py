@@ -30,15 +30,21 @@ async def create_pending_approvals(
     *,
     conversation_id: uuid.UUID,
     tool_uses: list[dict[str, Any]],
+    agent_name: str | None = None,
 ) -> list[ToolApproval]:
     """Persist one pending row per gated ``tool_use`` block of the assistant
-    message that just suspended the turn."""
+    message that just suspended the turn.
+
+    ``agent_name`` records who is asking, so a client can name the proposer
+    instead of assuming one. It comes from the runner, never from the tool's
+    arguments — those are written by the model."""
     rows = [
         ToolApproval(
             conversation_id=conversation_id,
             tool_use_id=str(tu.get("id", "")),
             tool_name=str(tu.get("name", "")),
             tool_input=tu.get("input") or {},
+            agent_name=agent_name,
             status=ToolApprovalStatus.pending.value,
         )
         for tu in tool_uses

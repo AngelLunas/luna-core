@@ -317,7 +317,10 @@ class AgentRunner:
                     tu for tu in tool_uses if tu.get("name", "") in approval_names
                 ]
                 created = await create_pending_approvals(
-                    db, conversation_id=scope_id, tool_uses=gated
+                    db,
+                    conversation_id=scope_id,
+                    tool_uses=gated,
+                    agent_name=agent.name,
                 )
                 for ap in created:
                     await emitter.emit(

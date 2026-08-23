@@ -16,6 +16,8 @@ class ToolApprovalRead(BaseModel):
     tool_use_id: str
     tool_name: str
     tool_input: dict
+    #: Canonical name of the agent that proposed the call; None on legacy rows.
+    agent_name: str | None
     status: str
     reason: str | None
     created_at: datetime
