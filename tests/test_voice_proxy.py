@@ -15,10 +15,17 @@ import pytest
 from luna_core.services.voice_transcription import run_transcription_session
 
 HANG = object()  # sentinel: the fake blocks forever at this point
+HANG_UNTIL_COMMIT = object()  # sentinel: the fake upstream waits for our commit
 
 
 def _text(payload: dict[str, Any]) -> dict[str, Any]:
     return {"type": "websocket.receive", "text": json.dumps(payload)}
+
+
+def _sleep(seconds: float) -> dict[str, Any]:
+    """Pause the client script — lets queued upstream events land first, the
+    way a real user's stop arrives seconds after the utterance's final."""
+    return {"type": "__sleep__", "seconds": seconds}
 
 
 def _audio(data: bytes) -> dict[str, Any]:
@@ -35,9 +42,14 @@ class FakeClient:
         self.close_code: int | None = None
 
     async def receive(self) -> dict[str, Any]:
-        if not self._script or self._script[0] is HANG:
-            await asyncio.Event().wait()
-        return self._script.pop(0)
+        while True:
+            if not self._script or self._script[0] is HANG:
+                await asyncio.Event().wait()
+            item = self._script.pop(0)
+            if item.get("type") == "__sleep__":
+                await asyncio.sleep(item["seconds"])
+                continue
+            return item
 
     async def send_text(self, data: str) -> None:
         self.sent.append(json.loads(data))
@@ -68,6 +80,10 @@ class FakeUpstream:
             item = self._events.pop(0)
             if item is HANG:
                 await asyncio.Event().wait()
+            if item is HANG_UNTIL_COMMIT:
+                while not self.events("input_audio_buffer.commit"):
+                    await asyncio.sleep(0.01)
+                item = self._events.pop(0)
             return json.dumps(item)
         if self._hang_after:
             await asyncio.Event().wait()
@@ -87,6 +103,7 @@ def _run(client: FakeClient, upstream: FakeUpstream, **overrides: Any):
         "max_seconds": 5.0,
         "idle_timeout": 5.0,
         "finalize_timeout": 0.05,
+        "vad_settle": 0.3,
     }
     defaults.update(overrides)
     return run_transcription_session(client, upstream, **defaults)
@@ -95,10 +112,12 @@ def _run(client: FakeClient, upstream: FakeUpstream, **overrides: Any):
 @pytest.mark.asyncio
 async def test_happy_path_stop() -> None:
     client = FakeClient(
-        [_audio(b"\x00\x01"), _audio(b"\x02\x03"), _audio(b"\x04\x05"), _text({"type": "stop"}), HANG]
+        [_audio(b"\x00\x01"), _audio(b"\x02\x03"), _audio(b"\x04\x05"), _sleep(0.15), _text({"type": "stop"}), HANG]
     )
     upstream = FakeUpstream(
         [
+            {"type": "input_audio_buffer.speech_started"},
+            {"type": "input_audio_buffer.speech_stopped"},
             {
                 "type": "conversation.item.input_audio_transcription.delta",
                 "item_id": "i1",
@@ -131,10 +150,12 @@ async def test_happy_path_stop() -> None:
     assert len(result.turn_usages) == 1
     assert result.turn_usages[0].audio_input_tokens == 35
 
-    # Upstream saw: session config, three appends, the stop commit.
+    # Upstream saw: session config, three appends — and NO stop commit: VAD
+    # had already segmented the utterance (speech_stopped), so the buffer
+    # held only trailing silence.
     assert upstream.sent[0]["type"] == "session.update"
     assert len(upstream.events("input_audio_buffer.append")) == 3
-    assert len(upstream.events("input_audio_buffer.commit")) == 1
+    assert len(upstream.events("input_audio_buffer.commit")) == 0
     assert upstream.closed
 
     # Client saw: ready → partials (accumulated) → final → session_closed.
@@ -227,11 +248,13 @@ async def test_stop_waits_for_in_flight_final() -> None:
     client = FakeClient([_audio(b"\x00\x01"), _text({"type": "stop"}), HANG])
     upstream = FakeUpstream(
         [
+            {"type": "input_audio_buffer.speech_started"},
+            {"type": "input_audio_buffer.speech_stopped"},
             {
                 "type": "conversation.item.input_audio_transcription.completed",
                 "item_id": "i1",
                 "transcript": "tarde pero llega",
-            }
+            },
         ]
     )
 
@@ -261,3 +284,92 @@ async def test_bad_client_frame_is_nonfatal() -> None:
     errors = client.frames("error")
     assert errors and errors[0]["code"] == "bad_frame"
     assert len(upstream.events("input_audio_buffer.append")) == 1
+
+
+@pytest.mark.asyncio
+async def test_stop_after_final_plus_trailing_silence_closes_immediately() -> None:
+    """The app keeps streaming mic silence after the user stops talking. Once
+    the utterance's final has landed, a stop must NOT wait the finalize grace
+    (silence is not a pending turn) and must NOT force-commit the silence."""
+    client = FakeClient(
+        [
+            _audio(b"\x00\x01"),
+            _sleep(0.15),  # the utterance's final lands here
+            _audio(b"\x00\x00"),  # trailing silence keeps streaming…
+            _audio(b"\x00\x00"),
+            _sleep(1.2),  # …for longer than the VAD settle window
+            _text({"type": "stop"}),
+            HANG,
+        ]
+    )
+    upstream = FakeUpstream(
+        [
+            {"type": "input_audio_buffer.speech_started"},
+            {"type": "input_audio_buffer.speech_stopped"},
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "i1",
+                "transcript": "ya está todo dicho",
+            },
+        ]
+    )
+
+    result = await _run(client, upstream, finalize_timeout=5.0)
+
+    assert result.reason == "stopped"
+    assert result.finals == 1
+    assert result.duration_seconds < 1.6  # ~1.35s of scripted client time, no grace wait
+    assert len(upstream.events("input_audio_buffer.commit")) == 0
+
+
+@pytest.mark.asyncio
+async def test_stop_mid_utterance_commits_and_waits_for_that_final() -> None:
+    """User taps stop while still talking: VAD saw speech start but no stop →
+    we force a commit and wait (only) for its final."""
+    client = FakeClient([_audio(b"\x00\x01"), _text({"type": "stop"}), HANG])
+    upstream = FakeUpstream(
+        [
+            {"type": "input_audio_buffer.speech_started"},
+            HANG_UNTIL_COMMIT,
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "i1",
+                "transcript": "cortado a media frase",
+            },
+        ]
+    )
+
+    result = await _run(client, upstream, finalize_timeout=5.0)
+
+    assert result.reason == "stopped"
+    assert len(upstream.events("input_audio_buffer.commit")) == 1
+    assert client.frames("final")[0]["text"] == "cortado a media frase"
+    assert result.duration_seconds < 1.0
+
+
+@pytest.mark.asyncio
+async def test_stop_mid_utterance_commit_empty_closes() -> None:
+    """Speech started, stop, but the forced commit finds nothing upstream:
+    the commit_empty error ends the wait instead of burning the grace."""
+    client = FakeClient([_audio(b"\x00\x01"), _text({"type": "stop"}), HANG])
+    upstream = FakeUpstream(
+        [
+            {"type": "input_audio_buffer.speech_started"},
+            HANG_UNTIL_COMMIT,
+            {
+                "type": "error",
+                "error": {"code": "input_audio_buffer_commit_empty", "message": "x"},
+            },
+            {
+                "type": "conversation.item.input_audio_transcription.failed",
+                "item_id": "i1",
+                "error": {"message": "no audio"},
+            },
+        ]
+    )
+
+    result = await _run(client, upstream, finalize_timeout=5.0)
+
+    assert result.reason == "stopped"
+    assert client.frames("error") == []  # commit_empty never reaches the client
+    assert result.duration_seconds < 1.0

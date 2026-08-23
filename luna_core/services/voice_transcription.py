@@ -146,9 +146,26 @@ def _usage_from_event(event: dict[str, Any]) -> VoiceUsage | None:
     )
 
 
+# Internal sentinels ``translate_upstream_event`` returns for events that are
+# not forwarded to the client but change the session's "anything still to
+# transcribe?" bookkeeping. Never sent on the wire.
+class _Sentinel:
+    __slots__ = ("name",)
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __repr__(self) -> str:
+        return f"<{self.name}>"
+
+
+_COMMIT_EMPTY = _Sentinel("commit_empty")
+_TURN_FAILED = _Sentinel("turn_failed")
+
+
 def translate_upstream_event(
     event: dict[str, Any], acc: dict[str, str]
-) -> ServerFrame | None:
+) -> ServerFrame | _Sentinel | None:
     """Map one upstream event to a protocol frame (None = drop). ``acc``
     accumulates transcription deltas per item so each ``partial`` carries the
     full running text of its turn."""
@@ -163,6 +180,10 @@ def translate_upstream_event(
         text = transcript if isinstance(transcript, str) else acc.get(item_id, "")
         acc.pop(item_id, None)
         return VoiceFinal(item_id=item_id, text=text, usage=_usage_from_event(event))
+    if etype == "conversation.item.input_audio_transcription.failed":
+        # The turn ended without text; still a finalisation for bookkeeping.
+        acc.pop(str(event.get("item_id") or ""), None)
+        return _TURN_FAILED
     if etype == "input_audio_buffer.speech_started":
         return VoiceSpeechStarted()
     if etype == "input_audio_buffer.speech_stopped":
@@ -171,9 +192,10 @@ def translate_upstream_event(
         error = event.get("error")
         error = error if isinstance(error, dict) else {}
         # Expected when `stop` lands with an empty/already-committed buffer —
-        # the commit we send on stop is best-effort (see _pump_client).
+        # the commit we send on stop is best-effort (see _pump_client). The
+        # session loop treats it as "nothing left to transcribe".
         if error.get("code") == "input_audio_buffer_commit_empty":
-            return None
+            return _COMMIT_EMPTY
         return VoiceError(
             code="upstream_error",
             message=str(error.get("message") or "upstream error"),
@@ -216,6 +238,9 @@ async def open_upstream(config: SttSessionConfig) -> UpstreamTransport:
     return await websockets.connect(
         config.url,
         additional_headers={"Authorization": f"Bearer {config.api_key}"},
+        # Bound the close handshake: the client has already been told the
+        # session is over by the time we close upstream.
+        close_timeout=3,
     )
 
 
@@ -243,6 +268,7 @@ async def run_transcription_session(
     max_seconds: float | None = None,
     idle_timeout: float | None = None,
     finalize_timeout: float | None = None,
+    vad_settle: float | None = None,
 ) -> SessionResult:
     """Bridge one client session to one upstream transcription session.
     Assumes the client socket is already accepted and the ``start`` frame
@@ -250,20 +276,46 @@ async def run_transcription_session(
     max_seconds = max_seconds if max_seconds is not None else float(settings.voice_stt_max_session_seconds)
     idle_timeout = idle_timeout if idle_timeout is not None else float(settings.voice_stt_idle_timeout_seconds)
     finalize_timeout = finalize_timeout if finalize_timeout is not None else settings.voice_stt_finalize_timeout_seconds
+    vad_settle = vad_settle if vad_settle is not None else settings.voice_stt_vad_settle_seconds
 
     started = time.monotonic()
     result = SessionResult()
     acc: dict[str, str] = {}
-    # True while audio has been appended upstream that no `final` has covered
-    # yet. Drives the post-stop grace: if nothing is pending the session
-    # closes immediately; if a turn is in flight we wait for its final (up to
-    # finalize_timeout) instead of blindly burning the whole timeout.
-    pending_audio = False
+    # Post-stop bookkeeping is driven by SPEECH, not by audio bytes: the client
+    # keeps streaming silence after the user stops talking, so "audio appended
+    # since the last final" is almost always true and would make every stop
+    # wait the whole finalize_timeout for a final that never comes (the forced
+    # commit of silence yields nothing — or worse, hallucinated words).
+    # ``turns_open`` counts VAD ``speech_started`` events not yet balanced by a
+    # transcription completed/failed; ``speech_open`` is True between
+    # ``speech_started`` and ``speech_stopped`` (the user is mid-utterance).
+    turns_open = 0
+    speech_open = False
+    # When audio started arriving that VAD has not (yet) given a verdict on —
+    # None once VAD reacts (speech_started/stopped) or a turn finalises. Lets a
+    # stop that lands a few hundred ms after the user began talking wait for
+    # VAD to catch up, while long-running silence VAD ignored closes at once.
+    unjudged_since: float | None = None
+    commit_sent = False
+
+    def pending() -> bool:
+        return turns_open > 0
+
+    async def send_commit() -> None:
+        """Force-transcribe what's in the upstream buffer (best-effort)."""
+        nonlocal commit_sent
+        if commit_sent:
+            return
+        commit_sent = True
+        try:
+            await upstream.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        except Exception:  # noqa: BLE001 — commit is best-effort
+            pass
 
     async def pump_client() -> str:
         """Client → upstream. Returns the end reason. The ``wait_for`` IS the
         idle timeout — any client frame resets it."""
-        nonlocal pending_audio
+        nonlocal unjudged_since
         while True:
             try:
                 message = await asyncio.wait_for(client.receive(), timeout=idle_timeout)
@@ -273,7 +325,8 @@ async def run_transcription_session(
                 return "client_disconnect"
             data = message.get("bytes")
             if data:
-                pending_audio = True
+                if unjudged_since is None:
+                    unjudged_since = time.monotonic()
                 await upstream.send(audio_frame_to_append(data))
                 continue
             text = message.get("text")
@@ -287,26 +340,29 @@ async def run_transcription_session(
                 )
                 continue
             if isinstance(frame, VoiceAudioJson):
-                pending_audio = True
+                if unjudged_since is None:
+                    unjudged_since = time.monotonic()
                 await upstream.send(
                     json.dumps(
                         {"type": "input_audio_buffer.append", "audio": frame.data}
                     )
                 )
             elif isinstance(frame, VoiceStop):
-                # Force transcription of any speech VAD hasn't segmented yet
-                # (user tapped stop mid-utterance). Empty-buffer errors from
-                # this commit are swallowed in translate_upstream_event.
-                try:
-                    await upstream.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                except Exception:  # noqa: BLE001 — commit is best-effort
-                    pass
+                # Only when the user tapped stop MID-UTTERANCE (VAD saw speech
+                # start but not stop) force-transcribe what's in the buffer.
+                # Otherwise VAD already committed every utterance and the
+                # buffer holds only trailing silence — committing that would
+                # at best waste a round trip and at worst transcribe silence
+                # into invented words. (The post-stop loop also commits if VAD
+                # reports speech_started moments AFTER the stop.)
+                if speech_open:
+                    await send_commit()
                 return "stopped"
             # a duplicate `start` is ignored
 
     async def pump_upstream() -> str:
         """Upstream → client. Returns when the upstream socket closes."""
-        nonlocal pending_audio
+        nonlocal turns_open, speech_open, unjudged_since
         while True:
             try:
                 raw = await upstream.recv()
@@ -319,14 +375,27 @@ async def run_transcription_session(
             frame = translate_upstream_event(event, acc)
             if frame is None:
                 continue
-            if isinstance(frame, VoiceFinal):
+            if frame is _COMMIT_EMPTY:
+                # Our stop-commit found nothing: no turn will come of it.
+                speech_open = False
+                continue
+            if frame is _TURN_FAILED:
+                turns_open = max(0, turns_open - 1)
+                continue
+            if isinstance(frame, VoiceSpeechStarted):
+                turns_open += 1
+                speech_open = True
+                unjudged_since = None
+            elif isinstance(frame, VoiceSpeechStopped):
+                speech_open = False
+                unjudged_since = None
+            elif isinstance(frame, VoiceFinal):
                 result.finals += 1
                 if frame.usage is not None:
                     result.turn_usages.append(frame.usage)
-                if not acc:
-                    # No other turn in flight — everything appended so far
-                    # is transcribed (drives the post-stop grace period).
-                    pending_audio = False
+                turns_open = max(0, turns_open - 1)
+                speech_open = False
+                unjudged_since = None
             await client.send_text(frame.model_dump_json())
 
     client_task: asyncio.Task[str] = asyncio.create_task(pump_client())
@@ -357,25 +426,37 @@ async def run_transcription_session(
             else:
                 result.reason = client_task.result()
                 if result.reason == "stopped":
-                    # Post-stop grace: only if a turn is still untranscribed,
-                    # and only until its final lands — a stop with nothing
-                    # pending closes immediately.
-                    grace_deadline = time.monotonic() + finalize_timeout
-                    while pending_audio and time.monotonic() < grace_deadline:
-                        if upstream_task.done():
+                    # Post-stop grace: only while a spoken turn is still
+                    # untranscribed, and only until its final lands — a stop
+                    # with nothing pending closes immediately. Fresh audio VAD
+                    # hasn't judged yet gets a short settle window; if VAD
+                    # then reports speech we force its commit and wait for
+                    # that final. Long-ignored silence does not count.
+                    now = time.monotonic()
+                    grace_deadline = now + finalize_timeout
+                    settle_deadline = (
+                        unjudged_since + vad_settle
+                        if unjudged_since is not None
+                        and now - unjudged_since < vad_settle
+                        else now
+                    )
+                    while time.monotonic() < grace_deadline and not upstream_task.done():
+                        if speech_open:
+                            await send_commit()
+                        if not pending() and time.monotonic() >= settle_deadline:
                             break
-                        await asyncio.sleep(0.05)
+                        await asyncio.sleep(0.02)
         else:
             result.reason = upstream_task.result() if upstream_task.exception() is None else "upstream_closed"
     finally:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        try:
-            await upstream.close()
-        except Exception:  # noqa: BLE001
-            pass
         result.duration_seconds = time.monotonic() - started
+        # Tell the client FIRST: the upstream close handshake can take a
+        # couple of seconds and the user is staring at a spinner until
+        # ``session_closed`` lands. The upstream is still always closed below
+        # (cost containment) before this returns.
         if result.reason != "client_disconnect":
             closed_reason = (
                 result.reason
@@ -393,6 +474,10 @@ async def run_transcription_session(
                 await client.close(1000)
             except Exception:  # noqa: BLE001
                 pass
+        try:
+            await upstream.close()
+        except Exception:  # noqa: BLE001
+            pass
     return result
 
 

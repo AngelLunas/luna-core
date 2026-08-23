@@ -115,6 +115,11 @@ class Settings(BaseSettings):
     # Upper bound on the post-stop grace period; the session closes as soon
     # as the in-flight turn's final lands (immediately if nothing is pending).
     voice_stt_finalize_timeout_seconds: float = 10.0
+    # How long after a `stop` to give server VAD to report speech it may not
+    # have flagged yet (audio appended moments before the stop, no VAD verdict
+    # on it). Only applies when such fresh audio exists; trailing silence that
+    # VAD has been ignoring for longer than this closes the session at once.
+    voice_stt_vad_settle_seconds: float = 1.0
 
     # MCP Server
     mcp_server_url: str = "http://localhost:8765"

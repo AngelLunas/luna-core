@@ -27,6 +27,9 @@ from luna_core.services.voice_transcription import (
 )
 
 
+ServerFrameTypes = (VoicePartial, VoiceFinal, VoiceSpeechStarted, VoiceSpeechStopped, VoiceError)
+
+
 class TestParseClientFrame:
     def test_start_with_language(self) -> None:
         frame = parse_client_frame('{"type": "start", "language": "es"}')
@@ -185,7 +188,8 @@ class TestTranslateUpstreamEvent:
         assert frame.code == "upstream_error"
         assert frame.message == "it broke"
 
-    def test_empty_commit_error_is_swallowed(self) -> None:
+    def test_empty_commit_error_is_not_forwarded(self) -> None:
+        # Not a client frame: the session loop consumes it as "nothing pending".
         frame = translate_upstream_event(
             {
                 "type": "error",
@@ -193,7 +197,22 @@ class TestTranslateUpstreamEvent:
             },
             {},
         )
-        assert frame is None
+        assert not isinstance(frame, ServerFrameTypes)
+        assert frame is not None and repr(frame) == "<commit_empty>"
+
+    def test_transcription_failed_is_not_forwarded(self) -> None:
+        acc = {"item_1": "partial text"}
+        frame = translate_upstream_event(
+            {
+                "type": "conversation.item.input_audio_transcription.failed",
+                "item_id": "item_1",
+                "error": {"message": "nope"},
+            },
+            acc,
+        )
+        assert not isinstance(frame, ServerFrameTypes)
+        assert frame is not None and repr(frame) == "<turn_failed>"
+        assert acc == {}
 
     def test_unknown_event_dropped(self) -> None:
         assert translate_upstream_event({"type": "session.updated"}, {}) is None
