@@ -220,6 +220,11 @@ class AgentRunner:
             "llm_router": self._llm,
             "mcp_client": self._mcp,
             "system_tool_registry": self._system_tools,
+            # Which agent is running this tool. A host that attributes what its
+            # tools write ("created by X") needs this: only the engine knows,
+            # and asking the tool's own arguments would let the model claim
+            # any author it likes.
+            "agent_name": agent.name,
         }
         if extra_call_context:
             call_context.update(extra_call_context)
@@ -518,6 +523,7 @@ class AgentRunner:
             "llm_router": self._llm,
             "mcp_client": self._mcp,
             "system_tool_registry": self._system_tools,
+            "agent_name": agent.name,  # see run()
         }
         if extra_call_context:
             call_context.update(extra_call_context)
