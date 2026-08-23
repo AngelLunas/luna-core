@@ -69,6 +69,8 @@ from luna_core.services.tool_approval import (
     decide,
     get_approval,
     list_approvals,
+    reject_pending_with_reason,
+    should_cascade_rejection,
 )
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
@@ -333,7 +335,11 @@ async def decide_tool_approval(
 ) -> SendMessageResponse:
     """Approve or reject a pending tool call. When the last pending approval of
     the turn is resolved, the turn resumes in-request: the decided tools run and
-    the LLM is re-invoked (unless the whole turn was rejected with no reason)."""
+    the LLM is re-invoked (unless the whole turn was rejected with no reason).
+
+    A rejection carrying a reason also rejects the turn's remaining gated calls
+    with that same reason (see ``reject_pending_with_reason``), so correcting one
+    call of a multi-call plan resumes the turn instead of stalling on siblings."""
     conversation = await _get_owned(db, conversation_id, user.id)
     needs_title = conversation.title is None  # pre-resume snapshot (see send())
     approval = await get_approval(db, approval_id)
@@ -354,6 +360,17 @@ async def decide_tool_approval(
             status_code=status.HTTP_409_CONFLICT,
             detail="approval already resolved",
         ) from exc
+
+    # A correction is about the plan, not about the single call it was typed
+    # under: reject the turn's remaining gated calls with the same reason so the
+    # turn resumes now and the LLM re-proposes with the correction in hand.
+    if should_cascade_rejection(payload.decision, payload.reason):
+        await reject_pending_with_reason(
+            db,
+            conversation_id,
+            reason=payload.reason or "",
+            resolved_by=user.id,
+        )
 
     # More approvals of this turn still pending → keep waiting.
     if await count_pending(db, conversation_id) > 0:

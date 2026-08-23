@@ -1,4 +1,4 @@
-"""Human-in-the-loop tool approval — runner semantics.
+"""Human-in-the-loop tool approval — decision semantics.
 
 Covers the decision logic without a DB, mirroring the fake-driven style of the
 other engine tests:
@@ -7,6 +7,8 @@ other engine tests:
   - ``_execute_tool_uses`` with decisions: a rejected tool_use produces a
     rejection tool_result and does NOT run the handler; an approved (or
     never-gated) one runs it.
+  - ``should_cascade_rejection``: a correction rejects the turn's other gated
+    calls too; a plain discard does not.
 """
 from __future__ import annotations
 
@@ -17,6 +19,7 @@ import pytest
 from luna_core.engine.agent import AgentRunner, _should_reinvoke
 from luna_core.mcp.system_tools.registry import SystemTool
 from luna_core.models.tool_approval import ToolApproval, ToolApprovalStatus
+from luna_core.services.tool_approval import should_cascade_rejection
 
 
 def _tool_use(tid: str, name: str = "log_care_event", inp: dict | None = None) -> dict:
@@ -127,3 +130,15 @@ async def test_approved_tool_use_runs_handler():
     assert blocks[0]["type"] == "tool_result"
     assert blocks[0]["tool_use_id"] == "a"
     assert "is_error" not in blocks[0]
+
+
+def test_should_cascade_rejection_cases():
+    rejected = ToolApprovalStatus.rejected.value
+    approved = ToolApprovalStatus.approved.value
+    # a correction applies to the whole plan → take the siblings down with it
+    assert should_cascade_rejection(rejected, "the light runs 6pm-12")
+    # a plain discard is per-call → siblings stay for the user to decide
+    assert not should_cascade_rejection(rejected, None)
+    assert not should_cascade_rejection(rejected, "   ")
+    # approving never cascades, reason or not
+    assert not should_cascade_rejection(approved, "looks good")

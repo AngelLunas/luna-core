@@ -122,6 +122,60 @@ async def decide(
     return await get_approval(db, approval_id)
 
 
+def should_cascade_rejection(decision: str, reason: str | None) -> bool:
+    """Whether resolving this approval should also reject the turn's remaining
+    gated calls.
+
+    Only a rejection carrying a correction cascades. A plain discard is a
+    per-call "not this one" and leaves its siblings for the user to decide.
+    """
+    return decision == ToolApprovalStatus.rejected.value and bool(
+        (reason or "").strip()
+    )
+
+
+async def reject_pending_with_reason(
+    db: AsyncSession,
+    conversation_id: uuid.UUID,
+    *,
+    reason: str,
+    resolved_by: uuid.UUID | None = None,
+) -> list[ToolApproval]:
+    """Reject every still-pending approval of the suspended turn, carrying the
+    correction the user wrote on one of them.
+
+    A gated plan reaches the user as several tool calls, but a correction ("the
+    light runs 6pm-12") is about the plan, not about the one call it was typed
+    under. Without this the turn stalls on siblings the user believes they
+    already answered, and the LLM never sees the correction. Rejecting them with
+    the same reason lets the turn resume now and hands the whole plan back for
+    the LLM to re-propose.
+
+    Safe to scope by conversation: ``send`` refuses to start a turn while any
+    approval is pending, so every pending row belongs to the one suspended turn.
+    """
+    stmt = (
+        update(ToolApproval)
+        .where(
+            ToolApproval.conversation_id == conversation_id,
+            ToolApproval.status == ToolApprovalStatus.pending.value,
+        )
+        .values(
+            status=ToolApprovalStatus.rejected.value,
+            reason=reason,
+            resolved_at=datetime.now(timezone.utc),
+            resolved_by=resolved_by,
+        )
+        .returning(ToolApproval.id)
+    )
+    ids = [row[0] for row in (await db.execute(stmt)).all()]
+    await db.commit()
+    if not ids:
+        return []
+    rows = await db.execute(select(ToolApproval).where(ToolApproval.id.in_(ids)))
+    return list(rows.scalars().all())
+
+
 async def decisions_by_tool_use(
     db: AsyncSession, conversation_id: uuid.UUID
 ) -> dict[str, ToolApproval]:
