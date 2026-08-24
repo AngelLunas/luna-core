@@ -209,11 +209,16 @@ async def test_propose_only_loop_executes_tool_in_runner(tmp_path):
     # Invocation 2 received the full transcript: the user ask, the proposed
     # call, and the runner's tool result — the stateless-render contract.
     second = json.loads((tmp_path / "invocation-1.json").read_text())
-    assert "<user>riega a Marta con 500 ml</user>" in second["prompt"]
-    assert '<tool_call id="toolu_1" name="water_plant">' in second["prompt"]
+    prompt = "".join(
+        b["text"]
+        for b in json.loads(second["prompt"])["message"]["content"]
+        if b["type"] == "text"
+    )
+    assert "<user>riega a Marta con 500 ml</user>" in prompt
+    assert '<tool_call id="toolu_1" name="water_plant">' in prompt
     # the fresh tool result is what invocation 2 must respond to
-    assert '<latest>\n<tool_result id="toolu_1">' in second["prompt"]
-    assert '"ok": true' in second["prompt"]
+    assert '<latest>\n<tool_result id="toolu_1">' in prompt
+    assert '"ok": true' in prompt
 
     # Both invocations advertised the catalog (tools present both times).
     first = json.loads((tmp_path / "invocation-0.json").read_text())

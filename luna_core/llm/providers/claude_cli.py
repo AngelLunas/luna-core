@@ -106,15 +106,43 @@ _LEAK_MARKERS = (
 )
 
 
+# Provider-agnostic builtin tool names (Agent.builtin_tools) → the CLI's own
+# tools that implement them inside the turn. Anything not listed is refused.
+_BUILTIN_TOOL_MAP: dict[str, tuple[str, ...]] = {
+    "web_search": ("WebSearch",),
+}
+_CLI_WEB_SEARCH_TOOL = "WebSearch"
+
+
 def _xml_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;")
+
+
+def _user_text_and_images(content: Any) -> tuple[str, list[str]]:
+    """Split an OpenAI-shaped user ``content`` (a string, or the multimodal
+    parts list ``_canonical_to_openai_messages`` builds when images resolved)
+    into its text and the image data URLs, in img-N order."""
+    if isinstance(content, str):
+        return content, []
+    texts: list[str] = []
+    images: list[str] = []
+    for part in content or []:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "text":
+            texts.append(part.get("text", ""))
+        elif part.get("type") == "image_url":
+            url = (part.get("image_url") or {}).get("url")
+            if url:
+                images.append(url)
+    return "\n".join(t for t in texts if t), images
 
 
 def _render_entry(msg: dict[str, Any]) -> list[str]:
     role = msg.get("role")
     content = msg.get("content")
     if role == "user":
-        text = content if isinstance(content, str) else json.dumps(content)
+        text, _images = _user_text_and_images(content)
         return [f"<user>{_xml_escape(text)}</user>"]
     if role == "assistant":
         out: list[str] = []
@@ -141,11 +169,11 @@ def _render_transcript(openai_msgs: list[dict[str, Any]]) -> str:
 
     A lone user message is sent raw. Otherwise everything up to the last
     assistant turn goes in <conversation_history> and the trailing run (new
-    user text and/or fresh tool results) in <latest>."""
+    user text and/or fresh tool results) in <latest>. Images are not part of
+    the text: ``_collect_images`` gathers them for the stream-json message."""
     if len(openai_msgs) == 1 and openai_msgs[0].get("role") == "user":
-        content = openai_msgs[0].get("content")
-        if isinstance(content, str):
-            return content
+        text, _images = _user_text_and_images(openai_msgs[0].get("content"))
+        return text
     last_assistant = max(
         (i for i, m in enumerate(openai_msgs) if m.get("role") == "assistant"),
         default=-1,
@@ -163,6 +191,45 @@ def _render_transcript(openai_msgs: list[dict[str, Any]]) -> str:
         )
     parts.append("<latest>\n" + "\n".join(latest) + "\n</latest>")
     return "\n\n".join(parts)
+
+
+def _collect_images(openai_msgs: list[dict[str, Any]]) -> list[str]:
+    """Every resolved image data URL across the history, in img-N order —
+    the same order the text notes ``[image attached: img-N (shown below)]``
+    use, so the model can match label to picture."""
+    images: list[str] = []
+    for msg in openai_msgs:
+        if msg.get("role") == "user":
+            images.extend(_user_text_and_images(msg.get("content"))[1])
+    return images
+
+
+def _data_url_to_image_block(url: str) -> dict[str, Any] | None:
+    """``data:<media_type>;base64,<data>`` → an Anthropic image content block.
+    Non-data URLs are skipped (the CLI has no way to fetch them for us)."""
+    if not url.startswith("data:"):
+        return None
+    header, sep, data = url.partition(",")
+    if not sep or ";base64" not in header:
+        return None
+    media_type = header[len("data:"):].split(";", 1)[0] or "image/png"
+    return {
+        "type": "image",
+        "source": {"type": "base64", "media_type": media_type, "data": data},
+    }
+
+
+def _stream_json_user_message(text: str, images: list[str]) -> str:
+    """The one stdin line for ``--input-format stream-json``: a user message
+    whose content is the prompt text plus any attached images."""
+    content: list[dict[str, Any]] = [{"type": "text", "text": text}]
+    for url in images:
+        block = _data_url_to_image_block(url)
+        if block is not None:
+            content.append(block)
+    return json.dumps(
+        {"type": "user", "message": {"role": "user", "content": content}}
+    ) + "\n"
 
 
 def _strip_leaked_transcript(text: str) -> str:
@@ -253,20 +320,30 @@ class ClaudeCLIProvider(GenericProvider):
         image_resolver: ImageResolver | None = None,
         builtin_tools: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        if builtin_tools:
-            raise ValueError(
-                "claude-cli provider does not support builtin_tools; "
-                "keep this agent on an HTTP provider"
-            )
+        cli_tools: list[str] = []
+        for name in builtin_tools or []:
+            mapped = _BUILTIN_TOOL_MAP.get(name)
+            if mapped is None:
+                raise ValueError(
+                    f"claude-cli provider has no equivalent for builtin tool "
+                    f"{name!r} (supported: {sorted(_BUILTIN_TOOL_MAP)})"
+                )
+            cli_tools.extend(t for t in mapped if t not in cli_tools)
         if not model:
             raise ValueError("claude-cli provider requires an explicit model")
-        # Vision is a pending spike (stream-json image blocks); attached
-        # images render as their img-N text notes for now, identical to the
-        # HTTP provider's text-model path.
-        openai_msgs = _canonical_to_openai_messages(messages, system="")
+        # Vision: resolved images become base64 blocks on the stream-json user
+        # message, in the same img-N order as their text notes. No resolver →
+        # text notes only, like the HTTP provider's text-model path.
+        image_urls = await self._resolve_image_urls(messages, image_resolver)
+        openai_msgs = _canonical_to_openai_messages(
+            messages, system="", image_urls=image_urls or None
+        )
         prompt = _render_transcript(openai_msgs)
         if prompt.startswith("<"):
             system = (system or "") + _HISTORY_PROTOCOL
+        stdin_payload = _stream_json_user_message(
+            prompt, _collect_images(openai_msgs)
+        )
 
         from luna_core.engine.emitter import EventEmitter
 
@@ -284,12 +361,14 @@ class ClaudeCLIProvider(GenericProvider):
                     model=model,
                     system=system,
                     tools=tools,
+                    cli_tools=cli_tools,
                     output_schema=output_schema,
                     work_dir=work_dir,
                 )
                 return await self._run_turn(
                     argv=argv,
-                    prompt=prompt,
+                    stdin_payload=stdin_payload,
+                    stop_on_proposal=bool(cli_tools),
                     work_dir=work_dir,
                     output_schema=output_schema,
                     model=model,
@@ -311,22 +390,34 @@ class ClaudeCLIProvider(GenericProvider):
         model: str,
         system: str,
         tools: list[ToolDefinition],
+        cli_tools: list[str],
         output_schema: dict[str, Any] | None,
         work_dir: str,
     ) -> list[str]:
         argv = [
             self._binary,
             "-p",
+            "--input-format",
+            "stream-json",
             "--output-format",
             "stream-json",
             "--verbose",
             "--include-partial-messages",
             "--no-session-persistence",
-            "--max-turns",
-            "1",
-            "--tools",
-            "",
             "--strict-mcp-config",
+        ]
+        if cli_tools:
+            # Builtin tools (web search) execute INSIDE the CLI and each one
+            # spends a turn, so the cap is raised; a proposal of one of OUR
+            # tools ends the run early instead (see _consume_stream).
+            argv += [
+                "--tools", ",".join(cli_tools),
+                "--allowedTools", ",".join(cli_tools),
+                "--max-turns", str(settings.claude_cli_builtin_max_turns),
+            ]
+        else:
+            argv += ["--tools", "", "--max-turns", "1"]
+        argv += [
             "--model",
             model,
             "--system-prompt",
@@ -359,7 +450,8 @@ class ClaudeCLIProvider(GenericProvider):
         self,
         *,
         argv: list[str],
-        prompt: str,
+        stdin_payload: str,
+        stop_on_proposal: bool,
         work_dir: str,
         output_schema: dict[str, Any] | None,
         model: str,
@@ -384,7 +476,7 @@ class ClaudeCLIProvider(GenericProvider):
         )
         assert proc.stdin is not None and proc.stdout is not None
 
-        state = _TurnState()
+        state = _TurnState(stop_on_proposal=stop_on_proposal)
         aborted = asyncio.Event()
 
         async def _watch_abort() -> None:
@@ -398,7 +490,7 @@ class ClaudeCLIProvider(GenericProvider):
 
         watcher = asyncio.create_task(_watch_abort())
         try:
-            proc.stdin.write(prompt.encode())
+            proc.stdin.write(stdin_payload.encode())
             await proc.stdin.drain()
             proc.stdin.close()
             await asyncio.wait_for(
@@ -415,6 +507,11 @@ class ClaudeCLIProvider(GenericProvider):
                 ),
                 timeout=self._timeout,
             )
+            if state.proposal_complete:
+                # One of our tools was proposed while builtin tools kept the
+                # turn cap high: the runner takes over from here, so the CLI
+                # (which would deny the call and let the model ramble) is cut.
+                proc.kill()
             await proc.wait()
         except asyncio.TimeoutError:
             proc.kill()
@@ -437,6 +534,9 @@ class ClaudeCLIProvider(GenericProvider):
             raise AbortSignalError(run_id, node_id)
 
         result = state.result_event
+        if result is None and state.proposal_complete:
+            # Cut on purpose — no result event, hence no usage for this call.
+            result = {"subtype": "proposal", "is_error": False}
         if result is None:
             stderr_tail = b""
             if proc.stderr is not None:
@@ -519,8 +619,27 @@ class ClaudeCLIProvider(GenericProvider):
             except json.JSONDecodeError:
                 continue
             etype = event.get("type")
+            if state.proposal_seen and etype not in ("assistant", "stream_event"):
+                # The proposing message is complete (the CLI moved on to
+                # deny/execute it): every sibling tool_use is in hand.
+                state.proposal_complete = True
+                return
             if etype == "stream_event":
                 inner = event.get("event", {})
+                if inner.get("type") == "content_block_start":
+                    block = inner.get("content_block") or {}
+                    if (
+                        block.get("type") == "tool_use"
+                        and block.get("name") == _CLI_WEB_SEARCH_TOOL
+                    ):
+                        await self._ensure_started(
+                            state, run_id, node_id, redis, build_io, message_id
+                        )
+                        await self._publish_builtin(
+                            redis, run_id, node_id, message_id, d_key, state,
+                            {"status": "searching"},
+                        )
+                    continue
                 if inner.get("type") != "content_block_delta":
                     continue
                 delta = inner.get("delta", {})
@@ -582,15 +701,105 @@ class ClaudeCLIProvider(GenericProvider):
                     )
                     state.thinking_chunk_index += 1
             elif etype == "assistant":
-                blocks = event.get("message", {}).get("content", []) or []
+                blocks = event.get("message", {}).get("content") or []
+                if isinstance(blocks, str):
+                    blocks = [{"type": "text", "text": blocks}]
                 for block in blocks:
-                    if block.get("type") in ("text", "thinking", "tool_use"):
-                        await self._ensure_started(
-                            state, run_id, node_id, redis, build_io, message_id
-                        )
-                        state.assistant_blocks.append(block)
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype not in ("text", "thinking", "tool_use"):
+                        continue
+                    await self._ensure_started(
+                        state, run_id, node_id, redis, build_io, message_id
+                    )
+                    if btype == "tool_use":
+                        if block.get("name") == _CLI_WEB_SEARCH_TOOL:
+                            # Runs inside the CLI; kept in the transcript as
+                            # the same web_search_call block the HTTP
+                            # provider persists, not as a tool_use.
+                            query = (block.get("input") or {}).get("query")
+                            state.web_searches[block.get("id")] = query
+                            state.assistant_blocks.append(
+                                {
+                                    "type": "web_search_call",
+                                    "id": block.get("id"),
+                                    "queries": [query] if query else [],
+                                }
+                            )
+                            continue
+                        if state.stop_on_proposal:
+                            state.proposal_seen = True
+                    state.assistant_blocks.append(block)
+            elif etype == "user":
+                # Builtin tool results come back as user tool_result events;
+                # the sidecar ``tool_use_result`` carries the structured hits.
+                for block in event.get("message", {}).get("content", []) or []:
+                    if not isinstance(block, dict):
+                        continue
+                    search_id = block.get("tool_use_id")
+                    if block.get("type") != "tool_result" or (
+                        search_id not in state.web_searches
+                    ):
+                        continue
+                    query = state.web_searches[search_id]
+                    hits: list[dict[str, str]] = []
+                    sidecar = event.get("tool_use_result")
+                    # ``results`` mixes the search's hit groups (dicts with a
+                    # ``content`` list of {title, url}) with plain strings
+                    # (the CLI's own summaries); only the dicts carry links.
+                    results = sidecar.get("results") if isinstance(sidecar, dict) else None
+                    for res in results or []:
+                        if not isinstance(res, dict):
+                            continue
+                        for hit in res.get("content") or []:
+                            if isinstance(hit, dict) and hit.get("url"):
+                                hits.append(
+                                    {"title": hit.get("title") or "", "url": hit["url"]}
+                                )
+                    # Same status sequence the HTTP provider emits for the
+                    # Responses API (…searching → completed → result), so a
+                    # client that flips its chip on "completed" sees it.
+                    await self._publish_builtin(
+                        redis, run_id, node_id, message_id, d_key, state,
+                        {"status": "completed"},
+                    )
+                    await self._publish_builtin(
+                        redis, run_id, node_id, message_id, d_key, state,
+                        {
+                            "status": "result",
+                            "query": query,
+                            "queries": [query] if query else [],
+                            "results": hits,
+                        },
+                    )
             elif etype == "result":
                 state.result_event = event
+
+    async def _publish_builtin(
+        self,
+        redis: Redis,
+        run_id: uuid.UUID,
+        node_id: str,
+        message_id: uuid.UUID,
+        d_key: str,
+        state: _TurnState,
+        payload: dict[str, Any],
+    ) -> None:
+        """Live web-search activity on the run channel — the same
+        ``builtin_tool_call`` event (tool=web_search, status=searching|result)
+        the HTTP provider publishes for the Responses API, so the chat UI
+        renders both identically. ``results`` is an addition the CLI can
+        offer: the hits' titles + urls."""
+        seq = await self._next_delta_sequence(redis, d_key, state.delta_seq_base)
+        await publish_run_event(
+            redis,
+            run_id,
+            RunEventType.builtin_tool_call,
+            node_id,
+            {"message_id": str(message_id), "tool": "web_search", **payload},
+            seq,
+        )
 
     async def _ensure_started(
         self,
@@ -623,11 +832,18 @@ class ClaudeCLIProvider(GenericProvider):
 class _TurnState:
     """Accumulates one CLI invocation's stream into canonical output."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, stop_on_proposal: bool = False) -> None:
         self.assistant_blocks: list[dict[str, Any]] = []
         self.delta_text: list[str] = []
         self.delta_thinking: list[str] = []
         self.result_event: dict[str, Any] | None = None
+        # Builtin-tools mode: end the call as soon as the model proposes one
+        # of OUR tools (the CLI would otherwise deny it and keep going).
+        self.stop_on_proposal = stop_on_proposal
+        self.proposal_seen = False
+        self.proposal_complete = False
+        # In-flight CLI web searches: tool_use id → query.
+        self.web_searches: dict[str, str | None] = {}
         self.message_started = False
         self.delta_seq_base = 0
         self.text_chunk_index = 0
@@ -664,6 +880,8 @@ class _TurnState:
                         "input": block.get("input", {}) or {},
                     }
                 )
+            elif btype == "web_search_call":
+                blocks.append(block)
         has_tool_use = any(b["type"] == "tool_use" for b in blocks)
         if not has_tool_use:
             # Backup capture: a proposed call always lands in

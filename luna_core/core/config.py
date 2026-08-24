@@ -86,6 +86,10 @@ class Settings(BaseSettings):
     claude_cli_binary: str = "claude"
     claude_cli_timeout_seconds: int = 300
     claude_cli_max_concurrency: int = 2
+    # Turn cap when an agent has builtin tools (web search runs inside the
+    # CLI and each search spends a turn). A proposal of one of our own tools
+    # still ends the call immediately, whatever the cap.
+    claude_cli_builtin_max_turns: int = 8
 
     # Streaming + abort signal TTLs (Redis seconds)
     run_stream_key_ttl_seconds: int = 3600

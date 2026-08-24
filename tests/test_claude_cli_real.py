@@ -200,3 +200,95 @@ def test_curated_model_list_is_current(model):
         timeout=180,
     ))
     assert out["is_error"] is False, f"alias '{model}' rejected: {out.get('result')}"
+
+
+def _tiny_png_base64() -> str:
+    """64x64 PNG, left half red / right half blue — stdlib only."""
+    import base64
+    import struct
+    import zlib
+
+    w = h = 64
+    row = b"".join(b"\xff\x00\x00" if x < w // 2 else b"\x00\x00\xff" for x in range(w))
+    raw = b"".join(b"\x00" + row for _ in range(h))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data)) + tag + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b"")
+    )
+    return base64.b64encode(png).decode()
+
+
+def test_stream_json_input_carries_images_to_the_model():
+    """Vision contract: a base64 image block on the stream-json user message
+    is seen by the model (stream-json in requires stream-json out)."""
+    message = {"type": "user", "message": {"role": "user", "content": [
+        {"type": "text", "text": "¿Qué colores tiene la imagen y cómo están "
+                                 "distribuidos? Responde en una frase."},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                     "data": _tiny_png_base64()}},
+    ]}}
+    stdout = _run(
+        ["--input-format", "stream-json", "--output-format", "stream-json",
+         "--verbose", "--model", "haiku", "--max-turns", "1",
+         "--system-prompt", "Eres un analista de imágenes."],
+        json.dumps(message) + "\n",
+    )
+    result = next(
+        json.loads(l) for l in stdout.splitlines() if l and '"type":"result"' in l.replace(" ", "")
+    )
+    text = str(result.get("result", "")).lower()
+    assert result["subtype"] == "success"
+    assert ("rojo" in text or "red" in text) and ("azul" in text or "blue" in text)
+
+
+def test_web_search_streams_observable_events():
+    """Web-search contract: the CLI's own WebSearch runs headless and its
+    activity is visible in stream-json — the tool_use with the query, and a
+    tool_result whose ``tool_use_result`` sidecar lists title+url hits. The
+    provider turns these into builtin_tool_call events for the UI."""
+    stdout = _run(
+        ["--output-format", "stream-json", "--verbose", "--model", "haiku",
+         "--tools", "WebSearch", "--allowedTools", "WebSearch", "--max-turns", "6",
+         "--system-prompt", "Usa WebSearch cuando necesites datos actuales."],
+        "Busca en la web cuál es la versión estable más reciente de Python y "
+        "responde con el número y la fuente.",
+        timeout=240,
+        # the model may search right up to the cap → exit 1 with a full stream
+        allow_nonzero_exit=True,
+    )
+    events = [json.loads(l) for l in stdout.splitlines() if l]
+    searches = [
+        b for e in events if e.get("type") == "assistant"
+        for b in e["message"].get("content", [])
+        if b.get("type") == "tool_use" and b.get("name") == "WebSearch"
+    ]
+    assert searches, "model did not use WebSearch"
+    assert searches[0]["input"].get("query")
+    ids = {s["id"] for s in searches}
+    sidecars = [
+        e.get("tool_use_result") for e in events if e.get("type") == "user"
+        and any(
+            isinstance(b, dict) and b.get("tool_use_id") in ids
+            for b in e.get("message", {}).get("content", [])
+        )
+    ]
+    assert sidecars and isinstance(sidecars[0], dict)
+    # `results` mixes hit groups (dicts with a content list) with plain
+    # string summaries; only the dicts carry links.
+    hits = [
+        h
+        for r in sidecars[0].get("results", [])
+        if isinstance(r, dict)
+        for h in r.get("content", [])
+        if isinstance(h, dict)
+    ]
+    assert hits and all("url" in h for h in hits)

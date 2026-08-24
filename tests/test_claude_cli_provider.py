@@ -25,6 +25,7 @@ from luna_core.llm.base import (
 )
 from luna_core.llm.providers.claude_cli import (
     ClaudeCLIProvider,
+    _data_url_to_image_block,
     _render_transcript,
     _strip_leaked_transcript,
 )
@@ -33,10 +34,22 @@ from luna_core.models.usage import LLMUsage
 FAKE_BINARY = str(Path(__file__).parent / "fake_claude")
 
 
+def _stdin_message(inv: dict[str, Any]) -> dict[str, Any]:
+    """The stream-json user message the provider wrote to the CLI's stdin."""
+    return json.loads(inv["prompt"])["message"]
+
+
+def _stdin_text(inv: dict[str, Any]) -> str:
+    return "".join(
+        b["text"] for b in _stdin_message(inv)["content"] if b["type"] == "text"
+    )
+
+
 class _FakeRedis:
     def __init__(self) -> None:
         self.strings: dict[str, Any] = {}
         self.lists: dict[str, list] = {}
+        self.published: list[dict[str, Any]] = []
 
     async def exists(self, *keys):
         return sum(1 for k in keys if k in self.strings)
@@ -59,7 +72,8 @@ class _FakeRedis:
     async def get(self, key):
         return self.strings.get(key)
 
-    async def publish(self, *_a, **_k):
+    async def publish(self, _channel, message):
+        self.published.append(json.loads(message))
         return None
 
     async def delete(self, *keys):
@@ -191,10 +205,13 @@ async def test_text_turn_returns_blocks_and_records_usage(tmp_path):
     blocks = await h.complete()
 
     assert blocks == [{"type": "text", "text": "¡Hola!"}]
-    # prompt rode stdin, single-user-turn history stays raw
+    # prompt rode stdin as one stream-json user message; a single user turn
+    # stays raw text (no history envelope, no images)
     inv = h.invocation()
-    assert inv["prompt"] == "hola"
+    assert _stdin_message(inv)["content"] == [{"type": "text", "text": "hola"}]
     argv = inv["argv"]
+    assert argv[argv.index("--input-format") + 1] == "stream-json"
+    assert argv[argv.index("--tools") + 1] == ""
     assert argv[argv.index("--model") + 1] == "haiku"
     assert argv[argv.index("--system-prompt") + 1] == "Eres Savia."
     assert argv[argv.index("--max-turns") + 1] == "1"
@@ -389,13 +406,6 @@ async def test_timeout_kills_process(tmp_path):
         await h.complete()
 
 
-@pytest.mark.asyncio
-async def test_builtin_tools_rejected(tmp_path):
-    h = _Harness(tmp_path, [[{"event": _result_event()}]])
-    with pytest.raises(ValueError, match="builtin_tools"):
-        await h.complete(builtin_tools=["web_search"])
-
-
 def test_transcript_single_user_message_stays_raw():
     msgs = [{"role": "user", "content": "hola"}]
     assert _render_transcript(msgs) == "hola"
@@ -479,4 +489,140 @@ async def test_history_turn_appends_protocol_and_strips_leak(tmp_path):
     inv = h.invocation()
     argv = inv["argv"]
     assert "Conversation history protocol" in argv[argv.index("--system-prompt") + 1]
-    assert inv["prompt"].startswith("<conversation_history>")
+    assert _stdin_text(inv).startswith("<conversation_history>")
+
+
+@pytest.mark.asyncio
+async def test_builtin_tools_rejected_when_unmapped(tmp_path):
+    h = _Harness(tmp_path, [[{"event": _result_event()}]])
+    with pytest.raises(ValueError, match="no equivalent for builtin tool"):
+        await h.complete(builtin_tools=["code_interpreter"])
+
+
+_PNG_DATA_URL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+
+
+def test_data_url_to_image_block():
+    block = _data_url_to_image_block(_PNG_DATA_URL)
+    assert block == {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": _PNG_DATA_URL.split(",", 1)[1],
+        },
+    }
+    assert _data_url_to_image_block("https://example.com/a.png") is None
+
+
+@pytest.mark.asyncio
+async def test_vision_attaches_resolved_images_to_the_stdin_message(tmp_path):
+    h = _Harness(tmp_path, [[*_text_events("Veo una hoja."), {"event": _result_event()}]])
+
+    async def resolver(media_id: str) -> str | None:
+        return _PNG_DATA_URL if media_id == "m1" else None
+
+    blocks = await h.complete(
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "¿qué le pasa?"},
+                {"type": "image", "media_id": "m1"},
+                {"type": "image", "media_id": "m-unresolved"},
+            ],
+        }],
+        image_resolver=resolver,
+    )
+    assert blocks == [{"type": "text", "text": "Veo una hoja."}]
+    content = _stdin_message(h.invocation())["content"]
+    # text keeps the img-N notes (shown vs not), pixels follow as one block
+    assert content[0]["type"] == "text"
+    assert "[image attached: img-1 (shown below)]" in content[0]["text"]
+    assert "[image attached: img-2]" in content[0]["text"]
+    assert [b["type"] for b in content[1:]] == ["image"]
+    assert content[1]["source"]["media_type"] == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_web_search_runs_in_cli_and_streams_ui_events(tmp_path):
+    search_id = "toolu_ws1"
+    scenario = [[
+        {"event": {"type": "stream_event", "event": {
+            "type": "content_block_start",
+            "content_block": {"type": "tool_use", "id": search_id,
+                              "name": "WebSearch", "input": {}},
+        }}},
+        {"event": {"type": "assistant", "message": {"content": [{
+            "type": "tool_use", "id": search_id, "name": "WebSearch",
+            "input": {"query": "araña roja tratamiento"},
+        }]}}},
+        {"event": {
+            "type": "user",
+            "message": {"content": [{
+                "type": "tool_result", "tool_use_id": search_id,
+                "content": "Web search results for query: ...",
+            }]},
+            "tool_use_result": {
+                "query": "araña roja tratamiento",
+                # the real CLI mixes hit groups with plain-string summaries
+                "results": [
+                    "Resumen en texto que no trae enlaces",
+                    {"content": [
+                        {"title": "Guía araña roja", "url": "https://ejemplo.org/arana"},
+                        {"title": "Otra", "url": "https://ejemplo.org/otra"},
+                    ]},
+                ],
+            },
+        }},
+        *_text_events("La araña roja se trata con..."),
+        {"event": _result_event(num_turns=2)},
+    ]]
+    h = _Harness(tmp_path, scenario)
+    blocks = await h.complete(builtin_tools=["web_search"])
+
+    argv = h.invocation()["argv"]
+    assert argv[argv.index("--tools") + 1] == "WebSearch"
+    assert argv[argv.index("--allowedTools") + 1] == "WebSearch"
+    assert int(argv[argv.index("--max-turns") + 1]) > 1
+    # transcript keeps the search as the same block the HTTP provider persists
+    assert blocks == [
+        {"type": "web_search_call", "id": search_id, "queries": ["araña roja tratamiento"]},
+        {"type": "text", "text": "La araña roja se trata con..."},
+    ]
+    # live UI events: searching → result (with the hits), on the run channel
+    builtin = [e for e in h.redis.published if e["event_type"] == "builtin_tool_call"]
+    assert [e["payload"]["status"] for e in builtin] == [
+        "searching", "completed", "result",
+    ]
+    assert all(e["payload"]["tool"] == "web_search" for e in builtin)
+    result = builtin[2]["payload"]
+    assert result["query"] == "araña roja tratamiento"
+    assert result["queries"] == ["araña roja tratamiento"]
+    assert [r["url"] for r in result["results"]] == [
+        "https://ejemplo.org/arana", "https://ejemplo.org/otra",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_builtin_mode_cuts_the_cli_when_our_tool_is_proposed(tmp_path):
+    # With the turn cap raised for web search, a savia tool proposal must end
+    # the call at once: the CLI would deny it and the model would ramble.
+    scenario = [[
+        {"event": {"type": "assistant", "message": {"content": [{
+            "type": "tool_use", "id": "toolu_1", "name": "mcp__luna__water_plant",
+            "input": {"plant_name": "Marta"},
+        }]}}},
+        {"event": {"type": "system", "subtype": "permission_denied",
+                   "tool_name": "mcp__luna__water_plant", "tool_use_id": "toolu_1"}},
+        {"sleep": 20},  # the CLI would keep going; the provider must not wait
+        {"event": _result_event()},
+    ]]
+    h = _Harness(tmp_path, scenario)
+    tools = [ToolDefinition(name="water_plant", description="", input_schema={})]
+    blocks = await h.complete(tools=tools, builtin_tools=["web_search"])
+    assert blocks == [{
+        "type": "tool_use", "id": "toolu_1", "name": "water_plant",
+        "input": {"plant_name": "Marta"},
+    }]
+    # cut on purpose: no result event → no usage row for this call
+    assert [r for r in h.added if isinstance(r, LLMUsage)] == []

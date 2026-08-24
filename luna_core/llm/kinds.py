@@ -19,6 +19,11 @@ class ProviderKindSpec:
     # Whether chat calls need an API key on the row. Kinds that authenticate
     # out-of-band (a logged-in CLI) don't.
     requires_api_key: bool
+    # Whether the kind's models see attached images. True/False when the kind
+    # settles it (every model behind the Claude CLI is multimodal); None when
+    # it depends on the endpoint/model behind a generic HTTP row — the host
+    # decides for those.
+    vision: bool | None = None
 
 
 PROVIDER_KINDS: dict[str, ProviderKindSpec] = {
@@ -28,7 +33,10 @@ PROVIDER_KINDS: dict[str, ProviderKindSpec] = {
             kind="openai_compatible", label=None, requires_api_key=True
         ),
         ProviderKindSpec(
-            kind="claude_cli", label="Claude Code CLI", requires_api_key=False
+            kind="claude_cli",
+            label="Claude Code CLI",
+            requires_api_key=False,
+            vision=True,
         ),
     )
 }
