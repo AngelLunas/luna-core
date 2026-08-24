@@ -6,17 +6,20 @@ the turn endpoints need chat infrastructure the **host wires into ``app.state``*
 so luna-core stays free of any host's agent/tool/metering choices:
 
     app.state.chat_runner: ChatRunner                      # required for turns
-    app.state.chat_agent_resolver:                         # required for turns
-        Callable[[AsyncSession, Conversation], Awaitable[Agent]]
+    app.state.chat_agent_resolver: AgentResolver           # required for turns
     app.state.chat_metering_hook:                          # optional
         Callable[[MeteringContext], Awaitable[None]] | None
 
 The resolver picks which agent answers a given conversation (a host with one
-orchestrator just returns it); the metering hook, if set, runs after each turn.
+orchestrator just returns it; see ``AgentResolver`` for the routing-aware
+shape a multi-agent host can opt into); the metering hook, if set, runs after
+each turn.
 """
 from __future__ import annotations
 
 import asyncio
+import inspect
+import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -36,7 +39,7 @@ from luna_core.core.dependencies import (
 from luna_core.core.config import settings
 from luna_core.core.security import decode_access_token
 from luna_core.engine.agent import SuspendedForApproval
-from luna_core.engine.chat import ChatRunner
+from luna_core.engine.chat import ChatRunner, ConversationIO
 from luna_core.llm.base import AbortSignalError, abort_key
 from luna_core.engine.websocket import WebSocketManager
 from luna_core.models.agent import Agent
@@ -51,6 +54,8 @@ from luna_core.schemas.conversation import (
     SendMessageResponse,
 )
 from luna_core.schemas.tool_approval import ToolApprovalDecision, ToolApprovalRead
+from luna_core.models.event import RunEventType
+from luna_core.services.agent_routing import ROUTING_NODE, handoff_preamble
 from luna_core.services.auto_title import maybe_title_conversation
 from luna_core.services.conversation import (
     ConversationNotFound,
@@ -75,7 +80,19 @@ from luna_core.services.tool_approval import (
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
-AgentResolver = Callable[[AsyncSession, Conversation], Awaitable[Agent]]
+logger = logging.getLogger(__name__)
+
+# The resolver picks which agent answers a conversation's next turn. Two
+# accepted shapes:
+#   (db, conversation)                       — the original contract
+#   (db, conversation, *, query, io)         — routing-aware: also receives the
+#       turn's new user text (None on continuations/resumes) and a
+#       ConversationIO to emit routing lifecycle events (routing_started /
+#       routing_decided) on the conversation's live channel. A host that
+#       classifies cold-start turns (see services.agent_routing) uses both.
+# ``_resolve_agent`` inspects the callable once per call and passes only what
+# it accepts, so existing hosts keep working unchanged.
+AgentResolver = Callable[..., Awaitable[Agent]]
 
 # Multi-agent handoff: after a turn, the resolver is consulted again; if a tool
 # changed which agent is active (e.g. a terminal ``route_to_*`` tool), the same
@@ -122,6 +139,34 @@ def _maybe_spawn_auto_title(
     )
     _auto_title_tasks.add(task)
     task.add_done_callback(_auto_title_tasks.discard)
+
+
+def _resolver_takes_routing_kwargs(resolver: AgentResolver) -> bool:
+    """Whether the host resolver accepts the routing-aware kwargs (see
+    ``AgentResolver``)."""
+    try:
+        params = inspect.signature(resolver).parameters
+    except (TypeError, ValueError):
+        return False
+    if any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    ):
+        return True
+    return "query" in params and "io" in params
+
+
+async def _resolve_agent(
+    resolver: AgentResolver,
+    db: AsyncSession,
+    conversation: Conversation,
+    *,
+    query: str | None = None,
+    io: ConversationIO | None = None,
+) -> Agent:
+    """Call the host resolver with as much context as it accepts."""
+    if _resolver_takes_routing_kwargs(resolver):
+        return await resolver(db, conversation, query=query, io=io)
+    return await resolver(db, conversation)
 
 
 @dataclass
@@ -240,7 +285,13 @@ async def send(
         )
     runner = _chat_runner(request)
     resolver = _agent_resolver(request)
-    agent = await resolver(db, conversation)
+    # The turn's live channel, up before the agent is even chosen — a
+    # routing-aware resolver emits routing_started/routing_decided on it so
+    # the client can show the decision phase ahead of the first token.
+    io = ConversationIO(db, redis, conversation_id)
+    agent = await _resolve_agent(
+        resolver, db, conversation, query=payload.new_message, io=io
+    )
 
     # Clear any stale abort flag from a prior turn (the key lingers for its TTL
     # and is never auto-cleared) so it can't kill this fresh turn.
@@ -383,10 +434,13 @@ async def decide_tool_approval(
             pending=[ToolApprovalRead.model_validate(p) for p in pending],
         )
 
-    # All resolved → resume the turn.
+    # All resolved → resume the turn (no new user text, so a routing-aware
+    # resolver just returns the sticky agent).
     resolver = _agent_resolver(request)
     runner = _chat_runner(request)
-    agent = await resolver(db, conversation)
+    agent = await _resolve_agent(
+        resolver, db, conversation, io=ConversationIO(db, redis, conversation_id)
+    )
     result = await runner.resume(
         agent=agent,
         conversation_id=conversation_id,
@@ -502,28 +556,43 @@ async def _follow_handoffs(
 ) -> tuple[Agent, Any]:
     """Continue the request under a new agent while the resolver keeps changing.
 
-    A turn can hand the conversation off (a terminal ``route_to_*`` tool flips the
+    A turn can hand the conversation off (the terminal transfer tool flips the
     host's routing); we re-consult the resolver and, if the active agent changed,
     run it on the existing history with no new user message so the now-active
     agent answers in the same request. Stops when the agent stabilises, the turn
-    suspends for approval, or the hop cap is hit."""
+    suspends for approval, or the hop cap is hit.
+
+    Each continuation turn gets the handoff preamble appended to its system
+    prompt: the receiving agent's transcript ends with the *previous* agent's
+    transfer call, and without an explicit "you are the new agent now — carry
+    on with the pending request" models routinely keep narrating the old
+    agent's voice ("I'll pass you to the doctor") instead of answering."""
     runner = _chat_runner(request)
     resolver = _agent_resolver(request)
+    io = ConversationIO(db, redis, conversation.id) if redis is not None else None
     hops = 0
     while not isinstance(result, SuspendedForApproval) and hops < MAX_HANDOFF_HOPS:
-        next_agent = await resolver(db, conversation)
+        next_agent = await _resolve_agent(
+            resolver, db, conversation, query=query, io=io
+        )
         if next_agent.id == agent.id:
             break
+        await _emit_routing_decided(io, from_agent=agent, to_agent=next_agent)
         agent = next_agent
+        system_prompt = await _augment_system_prompt(
+            request, db, conversation, agent, query
+        )
+        preamble = handoff_preamble(agent)
+        system_prompt = (
+            f"{system_prompt}\n\n{preamble}" if system_prompt else preamble
+        )
         result = await runner.send(
             agent=agent,
             conversation_id=conversation.id,
             new_message=None,
             db=db,
             redis=redis,
-            system_prompt=await _augment_system_prompt(
-                request, db, conversation, agent, query
-            ),
+            system_prompt=system_prompt,
             extra_call_context={"user_id": str(user_id)},
             image_resolver=await _image_resolver(
                 request, db, conversation, agent, user_id
@@ -531,6 +600,28 @@ async def _follow_handoffs(
         )
         hops += 1
     return agent, result
+
+
+async def _emit_routing_decided(
+    io: ConversationIO | None, *, from_agent: Agent, to_agent: Agent
+) -> None:
+    """Broadcast a handoff on the conversation's live channel — the client's
+    cue to switch the speaking identity before the new agent's first token.
+    Best-effort: the event is UI sugar and must never cost the user the turn."""
+    if io is None:
+        return
+    try:
+        await io.emit(
+            RunEventType.routing_decided,
+            node_id=ROUTING_NODE,
+            payload={
+                "agent_name": to_agent.name,
+                "from_agent": from_agent.name,
+                "trigger": "handoff",
+            },
+        )
+    except Exception:  # noqa: BLE001 — see docstring
+        logger.exception("routing_decided emit failed for %s", io.scope_id)
 
 
 async def _turn_response(

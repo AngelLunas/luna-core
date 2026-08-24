@@ -90,6 +90,53 @@ async def test_pingpong_is_capped():
     assert len(calls) == MAX_HANDOFF_HOPS  # bounded, no infinite loop
 
 
+@pytest.mark.asyncio
+async def test_hop_appends_handoff_preamble_to_system_prompt():
+    # The continuation agent's transcript ends with the previous agent's
+    # transfer call — the preamble is what stops it from narrating that voice.
+    orch, doc = _Agent("orch"), _Agent("doc")
+    seq = [doc, doc]
+    prompts: list[str] = []
+
+    async def send(**kw):
+        prompts.append(kw["system_prompt"])
+        return "answer from doc"
+
+    async def resolver(_db, _convo):
+        return seq.pop(0)
+
+    request = _request(SimpleNamespace(send=send), resolver)
+    convo = SimpleNamespace(id=uuid.uuid4())
+    await _follow_handoffs(None, request, convo, None, uuid.uuid4(), orch, "x")
+    assert len(prompts) == 1
+    assert prompts[0].startswith("x\n\n[HANDOFF]")  # instructions kept, preamble appended
+    assert "not by you" in prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_routing_aware_resolver_receives_query_kwarg():
+    # A resolver declaring (query, io) gets the turn's user text — the seam a
+    # cold-start classifier hangs off. Legacy 2-arg resolvers (tests above)
+    # keep working via signature inspection.
+    orch = _Agent("orch")
+    seen: dict = {"count": 0}
+
+    async def resolver(_db, _convo, *, query=None, io=None):
+        seen["count"] += 1
+        seen["query"] = query
+        seen["io"] = io
+        return orch
+
+    request = _request(_runner([]), resolver)
+    convo = SimpleNamespace(id=uuid.uuid4())
+    await _follow_handoffs(
+        None, request, convo, None, uuid.uuid4(), orch, "x", query="user text"
+    )
+    assert seen["count"] == 1
+    assert seen["query"] == "user text"
+    assert seen["io"] is None  # no redis in this harness → no live channel
+
+
 # --- optional RAG prompt augmentation -------------------------------------
 
 def _req_with_provider(provider) -> SimpleNamespace:

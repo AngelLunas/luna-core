@@ -52,6 +52,11 @@ class RunEventType(str, enum.Enum):
     # conversation channel so an open chat updates its header/list live. Payload:
     # ``{conversation_id, title}``.
     conversation_titled = "conversation_titled"
+    # Chat routing lifecycle (pub/sub only — a chat scope never persists
+    # events, so these exist for the live UI: "picking an agent…" and the
+    # decision itself, emitted before the first token of the turn).
+    routing_started = "routing_started"
+    routing_decided = "routing_decided"
     tool_called = "tool_called"
     tool_result = "tool_result"
     human_checkpoint = "human_checkpoint"

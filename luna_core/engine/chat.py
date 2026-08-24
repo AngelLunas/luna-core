@@ -91,10 +91,14 @@ class ConversationIO:
         db: AsyncSession,
         redis: Redis,
         conversation_id: uuid.UUID,
+        agent_name: str | None = None,
     ) -> None:
         self._db = db
         self._redis = redis
         self._conversation_id = conversation_id
+        # Stamped on assistant rows so a reloaded transcript keeps per-bubble
+        # agent identity (the live stream already carries it in events).
+        self._agent_name = agent_name
 
     @property
     def scope_id(self) -> uuid.UUID:
@@ -103,7 +107,9 @@ class ConversationIO:
     def for_session(self, db: AsyncSession) -> "ConversationIO":
         """Sibling bound to ``db``, same redis + conversation. The streaming
         provider opens its own short-lived sessions and persists through this."""
-        return ConversationIO(db, self._redis, self._conversation_id)
+        return ConversationIO(
+            db, self._redis, self._conversation_id, agent_name=self._agent_name
+        )
 
     async def emit(
         self,
@@ -111,13 +117,23 @@ class ConversationIO:
         node_id: str | None = None,
         payload: dict[str, Any] | None = None,
     ) -> SupportsSequence:
+        payload = dict(payload or {})
+        # Stamp the speaking agent on the turn-start event so a multi-agent
+        # client can label the live bubble; the provider that emits it only
+        # knows the model, not the agent — this scope does.
+        if (
+            event_type is RunEventType.agent_message_started
+            and self._agent_name
+            and "agent_name" not in payload
+        ):
+            payload["agent_name"] = self._agent_name
         sequence = await _redis_event_sequence(self._redis, self._conversation_id)
         await publish_run_event(
             self._redis,
             self._conversation_id,
             event_type,
             node_id,
-            payload or {},
+            payload,
             sequence,
         )
         return _Sequenced(sequence)
@@ -146,6 +162,8 @@ class ConversationIO:
                 content=content,
                 is_partial=is_partial,
             )
+            if role is AgentMessageRole.assistant and self._agent_name:
+                kwargs["agent_name"] = self._agent_name
             # Honor a caller-supplied id so the row persisted at end-of-stream
             # shares the UUID already broadcast on the *_delta frames — the
             # client keys its rendered bubble off one stable id across REST+WS.
@@ -224,7 +242,7 @@ class ChatRunner:
         ``requires_approval``, the turn suspends and returns
         ``SuspendedForApproval`` — resume via :meth:`resume`."""
         history = await self._load_history(db, conversation_id)
-        io = ConversationIO(db, redis, conversation_id)
+        io = ConversationIO(db, redis, conversation_id, agent_name=agent.name)
         return await self._runner.run(
             agent=agent,
             history=history,
@@ -257,7 +275,7 @@ class ChatRunner:
         hands off to the runner, which executes the decided tools and either
         re-invokes the LLM or ends the turn."""
         history = await self._load_history(db, conversation_id)
-        io = ConversationIO(db, redis, conversation_id)
+        io = ConversationIO(db, redis, conversation_id, agent_name=agent.name)
         return await self._runner.resume(
             agent=agent,
             history=history,

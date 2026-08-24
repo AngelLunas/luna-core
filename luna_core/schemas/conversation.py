@@ -39,6 +39,9 @@ class ConversationMessageRead(BaseModel):
     role: str
     content: list
     is_partial: bool
+    # Authoring agent of an assistant row (canonical name); None on user rows
+    # and on rows persisted before attribution existed.
+    agent_name: str | None = None
     created_at: datetime
 
     @field_validator("role", mode="before")

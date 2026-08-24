@@ -123,6 +123,12 @@ class ConversationMessage(Base):
     is_partial: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    # Which agent authored an assistant turn (canonical agent name, not an FK
+    # — see the module docstring: the primitive stays decoupled from agents).
+    # A multi-agent host renders per-bubble identity from this when reloading
+    # a transcript; NULL on user rows and on rows persisted before the column
+    # existed (clients fall back to a generic label).
+    agent_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
