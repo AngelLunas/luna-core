@@ -24,6 +24,11 @@ class ProviderKindSpec:
     # it depends on the endpoint/model behind a generic HTTP row — the host
     # decides for those.
     vision: bool | None = None
+    # A cheap, fast model every provider of this kind can run — for side calls
+    # that need an answer, not depth (a routing classifier, a title). None when
+    # the kind cannot promise one (a generic HTTP row serves whatever its host
+    # lists) and the host must supply a model id of its own.
+    fast_model: str | None = None
 
 
 PROVIDER_KINDS: dict[str, ProviderKindSpec] = {
@@ -37,6 +42,7 @@ PROVIDER_KINDS: dict[str, ProviderKindSpec] = {
             label="Claude Code CLI",
             requires_api_key=False,
             vision=True,
+            fast_model="haiku",
         ),
     )
 }
