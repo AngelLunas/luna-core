@@ -78,6 +78,15 @@ class Settings(BaseSettings):
     llm_max_retries: int = 3
     llm_retry_base_delay_seconds: float = 1.0
 
+    # Claude Code CLI provider (kind=claude_cli rows). The binary must be
+    # logged into a Claude subscription on this machine (`claude login`);
+    # a row's base_url overrides the binary path per provider. Concurrency
+    # is a hard semaphore — every call spawns a CLI process, so keep it low
+    # on small hosts (Raspberry Pi: 1-2).
+    claude_cli_binary: str = "claude"
+    claude_cli_timeout_seconds: int = 300
+    claude_cli_max_concurrency: int = 2
+
     # Streaming + abort signal TTLs (Redis seconds)
     run_stream_key_ttl_seconds: int = 3600
     run_abort_key_ttl_seconds: int = 60

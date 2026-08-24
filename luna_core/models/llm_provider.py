@@ -20,6 +20,13 @@ class LLMProvider(Base):
     name: Mapped[str] = mapped_column(
         String(255), nullable=False, unique=True, index=True
     )
+    # Provider implementation discriminator. "openai_compatible" (default) is
+    # the HTTP GenericProvider; "claude_cli" shells out to the local Claude
+    # Code binary (subscription auth) — for that kind, base_url holds the
+    # binary path and api_key is unused.
+    kind: Mapped[str] = mapped_column(
+        String(32), nullable=False, server_default="openai_compatible"
+    )
     base_url: Mapped[str] = mapped_column(String(1024), nullable=False)
     # chat_url / models_url are optional overrides for hosts whose chat or
     # model-listing endpoints live somewhere different than base_url. When

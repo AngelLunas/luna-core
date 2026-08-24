@@ -101,6 +101,12 @@ class LLMRouter:
             return provider
 
     def _build_provider(self, row: LLMProvider) -> BaseLLMProvider:
+        if row.kind == "claude_cli":
+            # Local Claude Code binary on subscription auth. base_url holds
+            # the binary path ("claude" resolves via PATH); no API key.
+            from luna_core.llm.providers.claude_cli import ClaudeCLIProvider
+
+            return ClaudeCLIProvider(binary_path=row.base_url)
         api_key = get_decrypted_api_key(row)
         base_url_for_sdk = _normalize_chat_base_url(row.chat_url or row.base_url)
         # Embeddings on chat providers are unused — `embed()` always goes

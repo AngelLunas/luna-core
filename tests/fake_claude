@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""Fake `claude` binary for ClaudeCLIProvider tests.
+
+Reads the scenario from $FAKE_CLAUDE_DIR/scenario.json:
+
+    {"invocations": [[<step>, ...], ...]}
+
+Each invocation is a list of steps executed in order:
+  {"event": {...}}   -> print the event as one stream-json line
+  {"sleep": 1.5}     -> sleep (for abort/timeout tests)
+  {"exit": 2}        -> exit with this code immediately
+
+The Nth run of this binary plays invocations[N] (clamped to the last one).
+Every run records what the provider actually did to
+$FAKE_CLAUDE_DIR/invocation-<N>.json: argv, the prompt received on stdin,
+and — when an --mcp-config was passed — the parsed config plus the tools
+file it points at (captured here because the provider deletes its temp dir
+right after the run).
+"""
+import json
+import os
+import sys
+import time
+
+capture_dir = os.environ["FAKE_CLAUDE_DIR"]
+existing = [
+    name
+    for name in os.listdir(capture_dir)
+    if name.startswith("invocation-")
+]
+index = len(existing)
+
+prompt = sys.stdin.read()
+
+record = {"argv": sys.argv[1:], "prompt": prompt}
+argv = sys.argv[1:]
+if "--mcp-config" in argv:
+    config_path = argv[argv.index("--mcp-config") + 1]
+    with open(config_path) as f:
+        config = json.load(f)
+    record["mcp_config"] = config
+    for server in config.get("mcpServers", {}).values():
+        args = server.get("args", [])
+        if args:
+            tools_path = args[-1]
+            if os.path.exists(tools_path):
+                with open(tools_path) as f:
+                    record["tools_file"] = json.load(f)
+if "--json-schema" in argv:
+    record["json_schema"] = json.loads(argv[argv.index("--json-schema") + 1])
+
+with open(os.path.join(capture_dir, f"invocation-{index}.json"), "w") as f:
+    json.dump(record, f)
+
+with open(os.path.join(capture_dir, "scenario.json")) as f:
+    scenario = json.load(f)
+invocations = scenario["invocations"]
+steps = invocations[min(index, len(invocations) - 1)]
+
+for step in steps:
+    if "sleep" in step:
+        time.sleep(step["sleep"])
+    elif "exit" in step:
+        sys.exit(step["exit"])
+    elif "event" in step:
+        sys.stdout.write(json.dumps(step["event"]) + "\n")
+        sys.stdout.flush()

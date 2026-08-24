@@ -57,6 +57,7 @@ async def create_llm_provider(
 ) -> LLMProvider:
     provider = LLMProvider(
         name=payload.name,
+        kind=payload.kind,
         base_url=payload.base_url,
         chat_url=payload.chat_url,
         models_url=payload.models_url,
@@ -155,7 +156,18 @@ async def list_upstream_models(
     is configured. The response is expected to follow the OpenAI shape:
     `{"data": [{"id": "...", "owned_by": "..."}, ...]}` — that's the
     contract every OpenAI-compatible host implements.
+
+    kind=claude_cli providers have no HTTP upstream: the curated alias list
+    is returned instead (aliases resolve to the newest model of each family,
+    so nothing goes stale), in the same shape the UI already consumes.
     """
+    if provider.kind == "claude_cli":
+        from luna_core.llm.providers.claude_cli import CLAUDE_CLI_MODELS
+
+        return [
+            LLMProviderModel(id=m["id"], owned_by="anthropic", label=m["label"])
+            for m in CLAUDE_CLI_MODELS
+        ]
     url = provider.models_url or _join_url(provider.base_url, "models")
     headers: dict[str, str] = {}
     api_key = get_decrypted_api_key(provider)

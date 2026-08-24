@@ -5,6 +5,7 @@ import uuid
 from fastapi import APIRouter, HTTPException, Response, status
 
 from luna_core.core.dependencies import DBSession, require_permission
+from luna_core.llm.kinds import display_name, kind_spec
 from luna_core.models.llm_provider import LLMProvider
 from luna_core.schemas.llm_provider import (
     LLMProviderCreate,
@@ -32,6 +33,9 @@ def _to_read(provider: LLMProvider) -> LLMProviderRead:
     return LLMProviderRead(
         id=provider.id,
         name=provider.name,
+        kind=provider.kind,
+        requires_api_key=kind_spec(provider.kind).requires_api_key,
+        display_name=display_name(provider.kind, provider.name),
         base_url=provider.base_url,
         chat_url=provider.chat_url,
         models_url=provider.models_url,
