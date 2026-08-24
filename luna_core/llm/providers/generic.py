@@ -219,6 +219,31 @@ def _canonical_to_openai_messages(
 # blocks the rest of the engine uses, so AgentRunner is unchanged.
 
 
+# Builtin tool names the Responses API executes server-side. An agent's
+# builtin list is shared across providers (the Claude CLI adds e.g.
+# web_fetch), so anything else is dropped here rather than sent upstream,
+# where it would 400 the whole turn.
+_RESPONSES_BUILTIN_TOOLS = frozenset(
+    {"web_search", "web_search_preview", "file_search", "code_interpreter",
+     "image_generation"}
+)
+
+
+def _responses_builtins(builtin_tools: list[str] | None) -> list[str]:
+    """The subset of an agent's builtin tools the Responses API can run."""
+    kept: list[str] = []
+    for name in builtin_tools or []:
+        if name in _RESPONSES_BUILTIN_TOOLS:
+            if name not in kept:
+                kept.append(name)
+        else:
+            logger.warning(
+                "responses provider: ignoring builtin tool %r (not a Responses "
+                "API tool)", name,
+            )
+    return kept
+
+
 def _tools_to_responses(
     tools: list[ToolDefinition], builtin_tools: list[str] | None
 ) -> list[dict[str, Any]]:
@@ -537,7 +562,9 @@ class GenericProvider:
     ) -> list[dict[str, Any]]:
         # Agents with built-in tools (e.g. web_search) run on the Responses API,
         # which executes those tools server-side while still calling our function
-        # tools. Same canonical blocks out, so AgentRunner is unchanged.
+        # tools. Same canonical blocks out, so AgentRunner is unchanged. Builtins
+        # this API doesn't offer are dropped; none left → plain chat-completions.
+        builtin_tools = _responses_builtins(builtin_tools) or None
         if builtin_tools:
             return await self._complete_via_responses(
                 messages=messages,

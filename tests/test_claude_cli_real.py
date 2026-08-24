@@ -292,3 +292,38 @@ def test_web_search_streams_observable_events():
         if isinstance(h, dict)
     ]
     assert hits and all("url" in h for h in hits)
+
+
+def test_web_fetch_streams_observable_events():
+    """Page-read contract: the CLI's WebFetch runs headless; the stream shows
+    the tool_use with the url and a tool_result whose ``tool_use_result``
+    sidecar carries url/code/bytes — what the provider turns into
+    builtin_tool_call(tool=web_fetch) events."""
+    stdout = _run(
+        ["--output-format", "stream-json", "--verbose", "--model", "haiku",
+         "--tools", "WebFetch", "--allowedTools", "WebFetch", "--max-turns", "4",
+         "--system-prompt", "Usa WebFetch para leer páginas."],
+        "Descarga https://devguide.python.org/versions/ con tu herramienta de "
+        "fetch y dime en una línea qué versiones aparecen como bugfix.",
+        timeout=180,
+        allow_nonzero_exit=True,
+    )
+    events = [json.loads(l) for l in stdout.splitlines() if l]
+    fetches = [
+        b for e in events if e.get("type") == "assistant"
+        for b in e["message"].get("content", [])
+        if b.get("type") == "tool_use" and b.get("name") == "WebFetch"
+    ]
+    assert fetches, "model did not use WebFetch"
+    assert fetches[0]["input"]["url"].startswith("https://devguide.python.org")
+    ids = {f["id"] for f in fetches}
+    sidecars = [
+        e.get("tool_use_result") for e in events if e.get("type") == "user"
+        and any(
+            isinstance(b, dict) and b.get("tool_use_id") in ids
+            for b in e.get("message", {}).get("content", [])
+        )
+    ]
+    assert sidecars and isinstance(sidecars[0], dict)
+    assert sidecars[0].get("code") == 200
+    assert sidecars[0].get("url", "").startswith("https://devguide.python.org")

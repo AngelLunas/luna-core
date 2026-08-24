@@ -313,7 +313,8 @@ async def send(
             extra_call_context={"user_id": str(user.id)},
             attachments=attachments,
             image_resolver=await _image_resolver(
-                request, db, conversation, agent, user.id
+                request, db, conversation, agent, user.id,
+                media_ids=list(payload.media_ids),
             ),
         )
         agent, result = await _follow_handoffs(
@@ -689,16 +690,36 @@ async def _image_resolver(
     conversation: Conversation,
     agent: Agent,
     user_id: uuid.UUID,
+    media_ids: list[uuid.UUID] | None = None,
 ) -> Any | None:
     """Per-agent image resolver from the optional host hook
     ``app.state.chat_image_resolver_factory``. The host decides whether THIS agent
     should see attached photos inline (vision-capable models) and how to scope them
     (e.g. only the latest turn's); a text-only agent gets ``None`` and keeps reading
-    the ``[image attached: …]`` notes. No hook ⇒ ``None`` ⇒ unchanged behaviour."""
+    the ``[image attached: …]`` notes. No hook ⇒ ``None`` ⇒ unchanged behaviour.
+
+    ``media_ids`` are the photos on the message being sent in THIS request. The
+    resolver is built before the runner persists that message, so a host that
+    scopes by "the latest stored user turn" would otherwise miss them (a fresh
+    conversation: none; a later turn: the previous photos). Hosts whose factory
+    accepts a ``media_ids`` keyword get them; older 4-argument factories are
+    called as before."""
     factory = getattr(request.app.state, "chat_image_resolver_factory", None)
     if factory is None:
         return None
+    if media_ids and _accepts_media_ids(factory):
+        return await factory(db, user_id, agent, conversation, media_ids=media_ids)
     return await factory(db, user_id, agent, conversation)
+
+
+def _accepts_media_ids(factory: Any) -> bool:
+    try:
+        params = inspect.signature(factory).parameters
+    except (TypeError, ValueError):
+        return False
+    return "media_ids" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
 
 
 def _chat_runner(request: Request) -> ChatRunner:

@@ -107,11 +107,15 @@ _LEAK_MARKERS = (
 
 
 # Provider-agnostic builtin tool names (Agent.builtin_tools) → the CLI's own
-# tools that implement them inside the turn. Anything not listed is refused.
+# tools that implement them inside the turn. Names not listed are ignored
+# (logged): an agent's builtin list is shared across providers, and each
+# provider offers what it can — the HTTP provider does the same.
 _BUILTIN_TOOL_MAP: dict[str, tuple[str, ...]] = {
     "web_search": ("WebSearch",),
+    "web_fetch": ("WebFetch",),
 }
 _CLI_WEB_SEARCH_TOOL = "WebSearch"
+_CLI_WEB_FETCH_TOOL = "WebFetch"
 
 
 def _xml_escape(text: str) -> str:
@@ -324,10 +328,11 @@ class ClaudeCLIProvider(GenericProvider):
         for name in builtin_tools or []:
             mapped = _BUILTIN_TOOL_MAP.get(name)
             if mapped is None:
-                raise ValueError(
-                    f"claude-cli provider has no equivalent for builtin tool "
-                    f"{name!r} (supported: {sorted(_BUILTIN_TOOL_MAP)})"
+                logger.warning(
+                    "claude-cli: ignoring builtin tool %r (no CLI equivalent; "
+                    "supported: %s)", name, sorted(_BUILTIN_TOOL_MAP),
                 )
+                continue
             cli_tools.extend(t for t in mapped if t not in cli_tools)
         if not model:
             raise ValueError("claude-cli provider requires an explicit model")
@@ -637,7 +642,7 @@ class ClaudeCLIProvider(GenericProvider):
                         )
                         await self._publish_builtin(
                             redis, run_id, node_id, message_id, d_key, state,
-                            {"status": "searching"},
+                            {"tool": "web_search", "status": "searching"},
                         )
                     continue
                 if inner.get("type") != "content_block_delta":
@@ -719,13 +724,31 @@ class ClaudeCLIProvider(GenericProvider):
                             # the same web_search_call block the HTTP
                             # provider persists, not as a tool_use.
                             query = (block.get("input") or {}).get("query")
-                            state.web_searches[block.get("id")] = query
+                            state.web_searches[str(block.get("id"))] = query
                             state.assistant_blocks.append(
                                 {
                                     "type": "web_search_call",
                                     "id": block.get("id"),
                                     "queries": [query] if query else [],
                                 }
+                            )
+                            continue
+                        if block.get("name") == _CLI_WEB_FETCH_TOOL:
+                            # Same idea for page reads: one block per fetch
+                            # (url known here, unlike at content_block_start)
+                            # and a live "fetching" signal for the UI.
+                            url = (block.get("input") or {}).get("url")
+                            state.web_fetches[str(block.get("id"))] = url
+                            state.assistant_blocks.append(
+                                {
+                                    "type": "web_fetch_call",
+                                    "id": block.get("id"),
+                                    "url": url,
+                                }
+                            )
+                            await self._publish_builtin(
+                                redis, run_id, node_id, message_id, d_key, state,
+                                {"tool": "web_fetch", "status": "fetching", "url": url},
                             )
                             continue
                         if state.stop_on_proposal:
@@ -735,12 +758,29 @@ class ClaudeCLIProvider(GenericProvider):
                 # Builtin tool results come back as user tool_result events;
                 # the sidecar ``tool_use_result`` carries the structured hits.
                 for block in event.get("message", {}).get("content", []) or []:
-                    if not isinstance(block, dict):
+                    if not isinstance(block, dict) or block.get("type") != "tool_result":
                         continue
-                    search_id = block.get("tool_use_id")
-                    if block.get("type") != "tool_result" or (
-                        search_id not in state.web_searches
-                    ):
+                    call_id = block.get("tool_use_id")
+                    if call_id in state.web_fetches:
+                        sidecar = event.get("tool_use_result")
+                        meta = sidecar if isinstance(sidecar, dict) else {}
+                        fetched = {
+                            "tool": "web_fetch",
+                            "url": meta.get("url") or state.web_fetches[call_id],
+                            "code": meta.get("code"),
+                            "bytes": meta.get("bytes"),
+                        }
+                        await self._publish_builtin(
+                            redis, run_id, node_id, message_id, d_key, state,
+                            {**fetched, "status": "completed"},
+                        )
+                        await self._publish_builtin(
+                            redis, run_id, node_id, message_id, d_key, state,
+                            {**fetched, "status": "result"},
+                        )
+                        continue
+                    search_id = call_id
+                    if search_id not in state.web_searches:
                         continue
                     query = state.web_searches[search_id]
                     hits: list[dict[str, str]] = []
@@ -762,11 +802,12 @@ class ClaudeCLIProvider(GenericProvider):
                     # client that flips its chip on "completed" sees it.
                     await self._publish_builtin(
                         redis, run_id, node_id, message_id, d_key, state,
-                        {"status": "completed"},
+                        {"tool": "web_search", "status": "completed"},
                     )
                     await self._publish_builtin(
                         redis, run_id, node_id, message_id, d_key, state,
                         {
+                            "tool": "web_search",
                             "status": "result",
                             "query": query,
                             "queries": [query] if query else [],
@@ -786,18 +827,19 @@ class ClaudeCLIProvider(GenericProvider):
         state: _TurnState,
         payload: dict[str, Any],
     ) -> None:
-        """Live web-search activity on the run channel — the same
-        ``builtin_tool_call`` event (tool=web_search, status=searching|result)
-        the HTTP provider publishes for the Responses API, so the chat UI
-        renders both identically. ``results`` is an addition the CLI can
-        offer: the hits' titles + urls."""
+        """Live builtin-tool activity on the run channel — the same
+        ``builtin_tool_call`` event the HTTP provider publishes for the
+        Responses API (tool=web_search, status=searching|completed|result),
+        so the chat UI renders both identically. The CLI adds what it can
+        see: the search hits (``results``) and page reads (tool=web_fetch:
+        fetching → completed → result with url/code/bytes)."""
         seq = await self._next_delta_sequence(redis, d_key, state.delta_seq_base)
         await publish_run_event(
             redis,
             run_id,
             RunEventType.builtin_tool_call,
             node_id,
-            {"message_id": str(message_id), "tool": "web_search", **payload},
+            {"message_id": str(message_id), **payload},
             seq,
         )
 
@@ -842,8 +884,9 @@ class _TurnState:
         self.stop_on_proposal = stop_on_proposal
         self.proposal_seen = False
         self.proposal_complete = False
-        # In-flight CLI web searches: tool_use id → query.
+        # In-flight CLI web searches / page reads: tool_use id → query / url.
         self.web_searches: dict[str, str | None] = {}
+        self.web_fetches: dict[str, str | None] = {}
         self.message_started = False
         self.delta_seq_base = 0
         self.text_chunk_index = 0
@@ -880,7 +923,7 @@ class _TurnState:
                         "input": block.get("input", {}) or {},
                     }
                 )
-            elif btype == "web_search_call":
+            elif btype in ("web_search_call", "web_fetch_call"):
                 blocks.append(block)
         has_tool_use = any(b["type"] == "tool_use" for b in blocks)
         if not has_tool_use:

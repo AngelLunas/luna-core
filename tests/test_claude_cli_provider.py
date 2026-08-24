@@ -493,10 +493,58 @@ async def test_history_turn_appends_protocol_and_strips_leak(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_builtin_tools_rejected_when_unmapped(tmp_path):
-    h = _Harness(tmp_path, [[{"event": _result_event()}]])
-    with pytest.raises(ValueError, match="no equivalent for builtin tool"):
-        await h.complete(builtin_tools=["code_interpreter"])
+async def test_unmapped_builtin_tools_are_ignored_not_fatal(tmp_path):
+    # The builtin list is shared across providers: one this CLI can't offer
+    # (an OpenAI-only tool) is skipped, the turn runs tool-less.
+    h = _Harness(tmp_path, [[*_text_events("ok"), {"event": _result_event()}]])
+    blocks = await h.complete(builtin_tools=["code_interpreter"])
+    assert blocks == [{"type": "text", "text": "ok"}]
+    argv = h.invocation()["argv"]
+    assert argv[argv.index("--tools") + 1] == ""
+    assert argv[argv.index("--max-turns") + 1] == "1"
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_runs_in_cli_and_streams_ui_events(tmp_path):
+    fetch_id = "toolu_wf1"
+    url = "https://ejemplo.org/protocolo-arana-roja"
+    scenario = [[
+        {"event": {"type": "assistant", "message": {"content": [{
+            "type": "tool_use", "id": fetch_id, "name": "WebFetch",
+            "input": {"url": url, "prompt": "resume el tratamiento"},
+        }]}}},
+        {"event": {
+            "type": "user",
+            "message": {"content": [{
+                "type": "tool_result", "tool_use_id": fetch_id,
+                "content": "# Protocolo\n...",
+            }]},
+            "tool_use_result": {"url": url, "code": 200, "bytes": 12081,
+                                "codeText": "OK", "durationMs": 900},
+        }},
+        *_text_events("Según el protocolo..."),
+        {"event": _result_event(num_turns=2)},
+    ]]
+    h = _Harness(tmp_path, scenario)
+    blocks = await h.complete(builtin_tools=["web_search", "web_fetch"])
+
+    argv = h.invocation()["argv"]
+    assert argv[argv.index("--tools") + 1] == "WebSearch,WebFetch"
+    assert argv[argv.index("--allowedTools") + 1] == "WebSearch,WebFetch"
+    assert blocks == [
+        {"type": "web_fetch_call", "id": fetch_id, "url": url},
+        {"type": "text", "text": "Según el protocolo..."},
+    ]
+    fetches = [
+        e["payload"] for e in h.redis.published
+        if e["event_type"] == "builtin_tool_call" and e["payload"]["tool"] == "web_fetch"
+    ]
+    assert [f["status"] for f in fetches] == ["fetching", "completed", "result"]
+    assert fetches[0]["url"] == url
+    assert fetches[2] == {
+        "message_id": fetches[2]["message_id"], "tool": "web_fetch",
+        "status": "result", "url": url, "code": 200, "bytes": 12081,
+    }
 
 
 _PNG_DATA_URL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="

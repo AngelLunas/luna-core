@@ -191,3 +191,15 @@ def test_responses_usage_adapter_handles_missing_details():
     a = _ResponsesUsage(SimpleNamespace(input_tokens=5, output_tokens=1, total_tokens=6))
     assert a.prompt_tokens == 5
     assert a.prompt_tokens_details.cached_tokens is None
+
+
+def test_responses_builtins_drop_tools_the_api_cannot_run():
+    # An agent's builtin list is shared across providers; the CLI-only
+    # web_fetch must not reach the Responses API (it would 400 the turn).
+    from luna_core.llm.providers.generic import _responses_builtins
+
+    assert _responses_builtins(["web_search", "web_fetch", "web_search"]) == [
+        "web_search"
+    ]
+    assert _responses_builtins(["web_fetch"]) == []
+    assert _responses_builtins(None) == []
