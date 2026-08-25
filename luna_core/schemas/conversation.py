@@ -50,6 +50,15 @@ class ConversationMessageRead(BaseModel):
         return v.value if isinstance(v, Enum) else v
 
 
+class AttachmentRef(BaseModel):
+    """One piece of media (already uploaded by the app) attached to a turn,
+    with what it is — the block type the providers label it by (``img-N`` for
+    an image, ``vid-N`` for a video)."""
+
+    type: Literal["image", "video", "audio"]
+    media_id: uuid.UUID
+
+
 class SendMessageRequest(BaseModel):
     # Empty is allowed only when media is attached (an image-only turn — "here's a
     # photo, what's wrong?"); the validator below enforces "text or media".
@@ -57,13 +66,35 @@ class SendMessageRequest(BaseModel):
     # Media (already uploaded by the app) attached to this turn. The ids are
     # opaque to luna-core — embedded as ``{"type":"image","media_id":...}`` blocks
     # so the agent can pass them to a tool, and a vision-native model can see them.
+    # ``media_ids`` is the legacy image-only form; ``attachments`` carries the
+    # kind (a video's block is what makes it a ``vid-N`` rather than lost).
     media_ids: list[uuid.UUID] = Field(default_factory=list)
+    attachments: list[AttachmentRef] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _require_text_or_media(self) -> "SendMessageRequest":
-        if not self.new_message.strip() and not self.media_ids:
-            raise ValueError("new_message or media_ids is required")
+        if not self.new_message.strip() and not self.media_ids and not self.attachments:
+            raise ValueError("new_message, media_ids or attachments is required")
         return self
+
+    def attachment_blocks(self) -> list[dict[str, str]]:
+        """The canonical content blocks for this turn's media, in the order
+        given (legacy ``media_ids`` first, as images), one per media id."""
+        blocks: list[dict[str, str]] = []
+        seen: set[str] = set()
+        refs = [("image", mid) for mid in self.media_ids] + [
+            (a.type, a.media_id) for a in self.attachments
+        ]
+        for kind, mid in refs:
+            key = str(mid)
+            if key in seen:
+                continue
+            seen.add(key)
+            blocks.append({"type": kind, "media_id": key})
+        return blocks
+
+    def attachment_media_ids(self) -> list[uuid.UUID]:
+        return [uuid.UUID(b["media_id"]) for b in self.attachment_blocks()]
 
 
 class SendMessageResponse(BaseModel):

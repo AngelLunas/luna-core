@@ -336,9 +336,10 @@ class ClaudeCLIProvider(GenericProvider):
             cli_tools.extend(t for t in mapped if t not in cli_tools)
         if not model:
             raise ValueError("claude-cli provider requires an explicit model")
-        # Vision: resolved images become base64 blocks on the stream-json user
-        # message, in the same img-N order as their text notes. No resolver →
-        # text notes only, like the HTTP provider's text-model path.
+        # Vision: resolved images (and video posters) become base64 blocks on
+        # the stream-json user message, in the same img-N / vid-N order as their
+        # text notes. No resolver → text notes only, like the HTTP provider's
+        # text-model path.
         image_urls = await self._resolve_image_urls(messages, image_resolver)
         openai_msgs = _canonical_to_openai_messages(
             messages, system="", image_urls=image_urls or None

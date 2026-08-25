@@ -592,6 +592,28 @@ async def test_vision_attaches_resolved_images_to_the_stdin_message(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_vision_attaches_a_video_poster_as_an_image_with_the_first_frame_note(tmp_path):
+    h = _Harness(tmp_path, [[*_text_events("Veo el primer fotograma."), {"event": _result_event()}]])
+
+    async def resolver(media_id: str) -> str | None:
+        return _PNG_DATA_URL if media_id == "v1" else None
+
+    await h.complete(
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "mira el clip"},
+                {"type": "video", "media_id": "v1"},
+            ],
+        }],
+        image_resolver=resolver,
+    )
+    content = _stdin_message(h.invocation())["content"]
+    assert "[video attached: vid-1 (first frame shown below)]" in content[0]["text"]
+    assert [b["type"] for b in content[1:]] == ["image"]
+
+
+@pytest.mark.asyncio
 async def test_web_search_runs_in_cli_and_streams_ui_events(tmp_path):
     search_id = "toolu_ws1"
     scenario = [[

@@ -75,9 +75,11 @@ class BaseLLMProvider(Protocol):
         the provider falls back to the flow ``EventEmitter`` for the given
         ``run_id`` — preserving the original behavior for direct callers.
 
-        ``image_resolver`` maps an attached image ``media_id`` to a renderable
+        ``image_resolver`` maps an attached media ``media_id`` to a renderable
         URL (typically a ``data:`` base64 URL) so a vision model sees the pixels.
-        Omitted → attached images render as text notes (the text-model path).
+        It is asked for videos too — the host answers with the video's poster
+        frame (a still image), or ``None``. Omitted → attached media render as
+        text notes (the text-model path).
         """
 
     async def embed(self, text: str) -> list[float]:

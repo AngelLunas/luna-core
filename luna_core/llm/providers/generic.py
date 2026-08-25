@@ -63,6 +63,33 @@ logger = logging.getLogger(__name__)
 # in which case the image falls back to a text note.
 ImageResolver = Callable[[str], Awaitable[str | None]]
 
+# Attached media the model is told about, by canonical block type: the label
+# prefix, the note's wording, and what "shown" means for it. A video is never
+# played — its poster (first frame) is what a vision model sees, and the note
+# says so, so the model does not claim to have watched it.
+_LABELED_KINDS: dict[str, tuple[str, str, str]] = {
+    "image": ("img", "image attached", "shown below"),
+    "video": ("vid", "video attached", "first frame shown below"),
+}
+
+
+class _MediaLabels:
+    """``img-N`` / ``vid-N`` counters: independent per kind, conversation-wide,
+    in order of appearance — the same order a host derives from its stored
+    messages, so a tool can resolve a label back to the media row."""
+
+    def __init__(self) -> None:
+        self._seq = {kind: 0 for kind in _LABELED_KINDS}
+
+    def next(self, kind: str) -> str:
+        self._seq[kind] += 1
+        return f"{_LABELED_KINDS[kind][0]}-{self._seq[kind]}"
+
+
+def _media_note(kind: str, label: str, shown: bool) -> str:
+    _prefix, what, shown_text = _LABELED_KINDS[kind]
+    return f"[{what}: {label} ({shown_text})]" if shown else f"[{what}: {label}]"
+
 
 def _tools_to_openai(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
     return [
@@ -106,14 +133,14 @@ def _canonical_to_openai_messages(
     if system:
         result.append({"role": "system", "content": system})
 
-    image_seq = 0  # conversation-wide img-N counter (order of appearance)
+    labels = _MediaLabels()  # img-N / vid-N, conversation-wide, by appearance
     for msg in messages:
         role = msg.get("role")
         content = msg.get("content", [])
         if role == "user":
             tool_results = [b for b in content if b.get("type") == "tool_result"]
             text_blocks = [b for b in content if b.get("type") == "text"]
-            image_blocks = [b for b in content if b.get("type") == "image"]
+            media_blocks = [b for b in content if b.get("type") in _LABELED_KINDS]
             if tool_results:
                 for block in tool_results:
                     payload = block.get("content")
@@ -126,17 +153,18 @@ def _canonical_to_openai_messages(
                             "content": payload,
                         }
                     )
-            if text_blocks or image_blocks:
-                labeled: list[tuple[str, str | None]] = []
-                for b in image_blocks:
-                    image_seq += 1
+            if text_blocks or media_blocks:
+                labeled: list[tuple[str, str, str | None]] = []
+                for b in media_blocks:
+                    kind = b["type"]
                     labeled.append(
                         (
-                            f"img-{image_seq}",
+                            kind,
+                            labels.next(kind),
                             (image_urls or {}).get(str(b.get("media_id"))),
                         )
                     )
-                rendered_urls = [url for _label, url in labeled if url]
+                rendered_urls = [url for _kind, _label, url in labeled if url]
                 joined_text = "\n".join(
                     b.get("text", "") for b in text_blocks if b.get("text")
                 )
@@ -145,10 +173,7 @@ def _canonical_to_openai_messages(
                     # image keeps its label note; one we could NOT resolve
                     # rides as a plain note (no pixels).
                     note = "\n".join(
-                        f"[image attached: {label} (shown below)]"
-                        if url
-                        else f"[image attached: {label}]"
-                        for label, url in labeled
+                        _media_note(kind, label, bool(url)) for kind, label, url in labeled
                     )
                     full_text = "\n".join(t for t in (joined_text, note) if t)
                     parts: list[dict[str, Any]] = []
@@ -163,9 +188,7 @@ def _canonical_to_openai_messages(
                     # Text path: render each attached media as its label note
                     # so the model knows a photo is present and can reference
                     # it by label in a tool call.
-                    notes = [
-                        f"[image attached: {label}]" for label, _url in labeled
-                    ]
+                    notes = [_media_note(kind, label, False) for kind, label, _url in labeled]
                     text = "\n".join(
                         p for p in [joined_text, *notes] if p
                     )
@@ -274,7 +297,7 @@ def _canonical_to_responses_input(
     ``input_image`` part; an unresolved one rides as ``[image attached: img-N]``.
     """
     items: list[dict[str, Any]] = []
-    image_seq = 0  # conversation-wide img-N counter (order of appearance)
+    labels = _MediaLabels()  # img-N / vid-N, conversation-wide, by appearance
     for msg in messages:
         role = msg.get("role")
         content = msg.get("content", []) or []
@@ -295,24 +318,18 @@ def _canonical_to_responses_input(
             for b in content:
                 if b.get("type") == "text" and b.get("text"):
                     parts.append({"type": "input_text", "text": b["text"]})
-                elif b.get("type") == "image":
-                    image_seq += 1
-                    label = f"img-{image_seq}"
+                elif b.get("type") in _LABELED_KINDS:
+                    kind = b["type"]
+                    label = labels.next(kind)
                     url = (image_urls or {}).get(str(b.get("media_id")))
                     if url:
                         parts.append(
-                            {
-                                "type": "input_text",
-                                "text": f"[image attached: {label} (shown below)]",
-                            }
+                            {"type": "input_text", "text": _media_note(kind, label, True)}
                         )
                         parts.append({"type": "input_image", "image_url": url})
                     else:
                         parts.append(
-                            {
-                                "type": "input_text",
-                                "text": f"[image attached: {label}]",
-                            }
+                            {"type": "input_text", "text": _media_note(kind, label, False)}
                         )
             if parts:
                 items.append({"role": "user", "content": parts})
@@ -1074,15 +1091,17 @@ class GenericProvider:
         messages: list[dict[str, Any]],
         image_resolver: ImageResolver | None,
     ) -> dict[str, str]:
-        """Resolve every distinct attached-image ``media_id`` to a renderable
-        URL via the injected resolver. No resolver → empty map (text-note path).
-        Each id is resolved once even if it recurs across turns."""
+        """Resolve every distinct attached media ``media_id`` (images AND
+        videos — for a video the host answers with its poster frame) to a
+        renderable URL via the injected resolver. No resolver → empty map
+        (text-note path). Each id is resolved once even if it recurs across
+        turns."""
         if image_resolver is None:
             return {}
         urls: dict[str, str] = {}
         for msg in messages:
             for block in msg.get("content", []) or []:
-                if not isinstance(block, dict) or block.get("type") != "image":
+                if not isinstance(block, dict) or block.get("type") not in _LABELED_KINDS:
                     continue
                 media_id = block.get("media_id")
                 if media_id is None:

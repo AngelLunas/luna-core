@@ -297,9 +297,7 @@ async def send(
     # and is never auto-cleared) so it can't kill this fresh turn.
     await redis.delete(abort_key(conversation_id))
 
-    attachments = [
-        {"type": "image", "media_id": str(mid)} for mid in payload.media_ids
-    ] or None
+    attachments = payload.attachment_blocks() or None
     try:
         result = await runner.send(
             agent=agent,
@@ -314,7 +312,7 @@ async def send(
             attachments=attachments,
             image_resolver=await _image_resolver(
                 request, db, conversation, agent, user.id,
-                media_ids=list(payload.media_ids),
+                media_ids=payload.attachment_media_ids(),
             ),
         )
         agent, result = await _follow_handoffs(

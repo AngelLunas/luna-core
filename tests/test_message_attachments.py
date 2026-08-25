@@ -172,3 +172,88 @@ def test_responses_input_labels_match_chat_completions():
     assert any("[image attached: img-2 (shown below)]" in t for t in second_texts)
     assert len(second_images) == 1
     assert second_images[0]["image_url"] == "data:image/png;base64,YmFy"
+
+
+# --- videos: vid-N, independent of img-N, never "watched" ---------------------
+
+
+def test_video_block_rendered_as_vid_label_note():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "mira este clip"},
+                {"type": "video", "media_id": "v-1"},
+            ],
+        }
+    ]
+    out = _canonical_to_openai_messages(messages, system="")
+    user = [m for m in out if m["role"] == "user"]
+    assert "[video attached: vid-1]" in user[0]["content"]
+    assert "v-1" not in user[0]["content"]
+
+
+def test_video_only_message_still_produces_a_user_turn():
+    messages = [{"role": "user", "content": [{"type": "video", "media_id": "v"}]}]
+    out = _canonical_to_openai_messages(messages, system="")
+    user = [m for m in out if m["role"] == "user"]
+    assert len(user) == 1
+    assert user[0]["content"] == "[video attached: vid-1]"
+
+
+def test_image_and_video_counters_are_independent():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "media_id": "a"},
+                {"type": "video", "media_id": "b"},
+            ],
+        },
+        {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "video", "media_id": "c"},
+                {"type": "image", "media_id": "d"},
+            ],
+        },
+    ]
+    out = _canonical_to_openai_messages(messages, system="")
+    notes = [m["content"] for m in out if m["role"] == "user"]
+    assert notes[0] == "[image attached: img-1]\n[video attached: vid-1]"
+    assert notes[1] == "[video attached: vid-2]\n[image attached: img-2]"
+
+
+def test_resolved_video_renders_its_poster_as_an_image_with_the_first_frame_note():
+    messages = [{"role": "user", "content": [{"type": "video", "media_id": "v"}]}]
+    out = _canonical_to_openai_messages(
+        messages, system="", image_urls={"v": "data:image/jpeg;base64,AAA="}
+    )
+    user = [m for m in out if m["role"] == "user"][0]
+    parts = user["content"]
+    assert parts[0] == {
+        "type": "text",
+        "text": "[video attached: vid-1 (first frame shown below)]",
+    }
+    assert parts[1] == {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAA="}}
+
+
+def test_responses_input_labels_videos_the_same_way():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hola"},
+                {"type": "image", "media_id": "a"},
+                {"type": "video", "media_id": "b"},
+            ],
+        }
+    ]
+    items = _canonical_to_responses_input(messages, image_urls={"b": "data:image/jpeg;base64,AAA="})
+    parts = items[0]["content"]
+    texts = [p["text"] for p in parts if p["type"] == "input_text"]
+    assert texts == ["hola", "[image attached: img-1]", "[video attached: vid-1 (first frame shown below)]"]
+    assert [p for p in parts if p["type"] == "input_image"] == [
+        {"type": "input_image", "image_url": "data:image/jpeg;base64,AAA="}
+    ]

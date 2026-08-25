@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 from pathlib import Path
 
 from luna_core.storage.base import BaseStorageBackend
@@ -36,6 +37,18 @@ class LocalStorageBackend(BaseStorageBackend):
         target = self._resolve(key)
         return await asyncio.to_thread(target.read_bytes)
 
+    async def upload_path(self, path: Path, key: str, mime_type: str) -> str:
+        target = self._resolve(key)
+        await asyncio.to_thread(_copy_file, Path(path), target)
+        return key
+
+    async def download_to_path(self, key: str, dst: Path) -> None:
+        await asyncio.to_thread(_copy_file, self._resolve(key), Path(dst))
+
+    def local_path(self, key: str) -> Path | None:
+        target = self._resolve(key)
+        return target if target.exists() else None
+
     async def delete(self, key: str) -> None:
         target = self._resolve(key)
         await asyncio.to_thread(_safe_remove, target)
@@ -48,6 +61,11 @@ def _write_bytes(target: Path, data: bytes) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     with open(target, "wb") as fh:
         fh.write(data)
+
+
+def _copy_file(src: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, target)
 
 
 def _safe_remove(target: Path) -> None:
