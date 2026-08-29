@@ -1079,9 +1079,17 @@ class GenericProvider:
 
     # ------------------------------------------------------------------ embed
     async def embed(self, text: str) -> list[float]:
+        # OpenAI's text-embedding-3-* natively down-project via ``dimensions``
+        # (so 1024-dim storage keeps their quality). Other OpenAI-compatible
+        # backends (Ollama, TEI) reject unknown params — send it only where it
+        # is understood; everyone else must already emit EMBEDDING_DIMENSIONS.
+        kwargs: dict[str, Any] = {}
+        if self._embedding_model.startswith("text-embedding-3"):
+            kwargs["dimensions"] = settings.embedding_dimensions
         response = await self._embed_client.embeddings.create(
             model=self._embedding_model,
             input=text,
+            **kwargs,
         )
         return list(response.data[0].embedding)
 
