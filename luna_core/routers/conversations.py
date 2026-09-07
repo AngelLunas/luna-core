@@ -57,6 +57,7 @@ from luna_core.schemas.tool_approval import ToolApprovalDecision, ToolApprovalRe
 from luna_core.models.event import RunEventType
 from luna_core.services.agent_routing import ROUTING_NODE, handoff_preamble
 from luna_core.services.auto_title import maybe_title_conversation
+from luna_core.services.flow import build_run_stream_snapshot
 from luna_core.services.conversation import (
     ConversationNotFound,
     create_conversation,
@@ -468,11 +469,27 @@ _ws_manager: WebSocketManager | None = None
 def get_ws_manager() -> WebSocketManager:
     """Lazily-built manager keyed by ``conversation_id``. ConversationIO
     publishes turn events on ``run_event_channel(conversation_id)`` (the default
-    ``channel_fn``); a chat timeline rehydrates from its messages + the live
-    delta stream, so no snapshot function is needed."""
+    ``channel_fn``).
+
+    A chat timeline rehydrates from its persisted messages + the live delta
+    stream — but the assistant row is only persisted at the END of a turn, so
+    a client that reconnects mid-stream (network blip, app foregrounded) used
+    to lose the prefix it had already painted and every delta until the next
+    ``agent_message_started``. The providers write each in-flight turn's
+    chunks to the same per-scope stream cache the flow engine uses (the chat
+    path's ``run_id`` IS the conversation id), so the runs channel's snapshot
+    builder serves here unchanged: on connect the client first receives the
+    in-flight chunks as synthetic delta frames with deterministic ids, then
+    the live stream, and dedupes any overlap by id."""
     global _ws_manager
     if _ws_manager is None:
-        _ws_manager = WebSocketManager(get_redis_client())
+        redis_client = get_redis_client()
+        _ws_manager = WebSocketManager(
+            redis_client,
+            snapshot_fn=lambda conversation_id: build_run_stream_snapshot(
+                redis_client, conversation_id
+            ),
+        )
     return _ws_manager
 
 

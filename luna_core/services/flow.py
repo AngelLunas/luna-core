@@ -815,6 +815,11 @@ async def build_run_stream_snapshot(
     the meta payload because we can no longer parse it out of the key.
 
     Returns an empty list when no streams are in flight for this run.
+
+    ``run_id`` is the scope the provider wrote the cache under — a flow run
+    id on the runs channel, a conversation id on the chat channel (the chat
+    runner passes the conversation id as the provider's ``run_id``). Nothing
+    here is run-specific, so both WebSocket managers share this builder.
     """
     # The ``message_id`` placeholder for scan only matches the
     # post-message_id segment; pre-message_id parts of the key are
