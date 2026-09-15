@@ -267,10 +267,23 @@ def _responses_builtins(builtin_tools: list[str] | None) -> list[str]:
     return kept
 
 
+# Builtins that resolve "today" and local results against a location.
+_LOCATED_BUILTINS = frozenset({"web_search", "web_search_preview"})
+
+
 def _tools_to_responses(
-    tools: list[ToolDefinition], builtin_tools: list[str] | None
+    tools: list[ToolDefinition],
+    builtin_tools: list[str] | None,
+    timezone: str | None = None,
 ) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = [{"type": name} for name in (builtin_tools or [])]
+    out: list[dict[str, Any]] = []
+    for name in builtin_tools or []:
+        builtin: dict[str, Any] = {"type": name}
+        # A search asked about "this week" answers for the user's week, not
+        # the server's.
+        if timezone and name in _LOCATED_BUILTINS:
+            builtin["user_location"] = {"type": "approximate", "timezone": timezone}
+        out.append(builtin)
     for tool in tools:
         out.append(
             {
@@ -576,7 +589,10 @@ class GenericProvider:
         make_io: IOFactory | None = None,
         image_resolver: ImageResolver | None = None,
         builtin_tools: list[str] | None = None,
+        timezone: str | None = None,
     ) -> list[dict[str, Any]]:
+        # Chat-completions has nothing tied to local time; only the Responses
+        # path (its web search) uses ``timezone``.
         # Agents with built-in tools (e.g. web_search) run on the Responses API,
         # which executes those tools server-side while still calling our function
         # tools. Same canonical blocks out, so AgentRunner is unchanged. Builtins
@@ -594,6 +610,7 @@ class GenericProvider:
                 make_io=make_io,
                 image_resolver=image_resolver,
                 builtin_tools=builtin_tools,
+                timezone=timezone,
             )
         accumulator = _StreamAccumulator()
         a_key = abort_key(run_id)
@@ -835,6 +852,7 @@ class GenericProvider:
         make_io: IOFactory | None,
         image_resolver: ImageResolver | None,
         builtin_tools: list[str],
+        timezone: str | None = None,
     ) -> list[dict[str, Any]]:
         """One streaming turn via the OpenAI Responses API. Built-in tools (e.g.
         web_search) run server-side; our function tools come back as ``tool_use``
@@ -859,7 +877,7 @@ class GenericProvider:
         request: dict[str, Any] = {
             "model": model or self._default_model,
             "input": _canonical_to_responses_input(messages, image_urls or None),
-            "tools": _tools_to_responses(tools, builtin_tools),
+            "tools": _tools_to_responses(tools, builtin_tools, timezone=timezone),
             "stream": True,
         }
         if system:

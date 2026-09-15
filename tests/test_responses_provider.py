@@ -203,3 +203,29 @@ def test_responses_builtins_drop_tools_the_api_cannot_run():
     ]
     assert _responses_builtins(["web_fetch"]) == []
     assert _responses_builtins(None) == []
+
+
+# --- the caller's timezone -------------------------------------------------
+
+def test_tools_to_responses_web_search_carries_the_callers_timezone():
+    out = _tools_to_responses([], ["web_search", "file_search"], timezone="America/Bogota")
+    assert out == [
+        {"type": "web_search", "user_location": {"type": "approximate", "timezone": "America/Bogota"}},
+        {"type": "file_search"},
+    ]
+
+
+def test_tools_to_responses_without_a_timezone_sends_no_location():
+    assert _tools_to_responses([], ["web_search"]) == [{"type": "web_search"}]
+
+
+def test_every_provider_takes_the_callers_timezone():
+    import inspect
+
+    from luna_core.llm.base import BaseLLMProvider
+    from luna_core.llm.providers.claude_cli import ClaudeCLIProvider
+    from luna_core.llm.providers.generic import GenericProvider
+    from luna_core.llm.router import LLMRouter
+
+    for impl in (BaseLLMProvider, GenericProvider, ClaudeCLIProvider, LLMRouter):
+        assert "timezone" in inspect.signature(impl.complete).parameters, impl.__name__

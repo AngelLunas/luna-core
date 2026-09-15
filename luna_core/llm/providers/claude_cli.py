@@ -323,6 +323,7 @@ class ClaudeCLIProvider(GenericProvider):
         make_io: IOFactory | None = None,
         image_resolver: ImageResolver | None = None,
         builtin_tools: list[str] | None = None,
+        timezone: str | None = None,
     ) -> list[dict[str, Any]]:
         cli_tools: list[str] = []
         for name in builtin_tools or []:
@@ -385,6 +386,7 @@ class ClaudeCLIProvider(GenericProvider):
                     message_id=message_id,
                     s_key=s_key,
                     d_key=d_key,
+                    timezone=timezone,
                 )
             finally:
                 shutil.rmtree(work_dir, ignore_errors=True)
@@ -468,10 +470,16 @@ class ClaudeCLIProvider(GenericProvider):
         message_id: uuid.UUID,
         s_key: str,
         d_key: str,
+        timezone: str | None = None,
     ) -> list[dict[str, Any]]:
         # The CLI must bill the subscription login, never an API key that
         # happens to be in the backend's environment.
         env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+        # The CLI writes its own "today's date" into the model's context from
+        # the process timezone: on a UTC server an evening turn was told that
+        # today is already tomorrow, against the host's own date block.
+        if timezone:
+            env["TZ"] = timezone
         proc = await asyncio.create_subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.PIPE,

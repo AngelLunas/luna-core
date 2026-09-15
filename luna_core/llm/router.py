@@ -133,6 +133,7 @@ class LLMRouter:
         make_io: IOFactory | None = None,
         image_resolver: Callable[[str], Any] | None = None,
         builtin_tools: list[str] | None = None,
+        timezone: str | None = None,
     ) -> list[dict[str, Any]]:
         attempt = 0
         last_exc: Exception | None = None
@@ -153,6 +154,7 @@ class LLMRouter:
                     make_io=make_io,
                     image_resolver=image_resolver,
                     builtin_tools=builtin_tools,
+                    timezone=timezone,
                 )
             except AbortSignalError:
                 raise

@@ -66,8 +66,13 @@ class BaseLLMProvider(Protocol):
         make_io: IOFactory | None = None,
         image_resolver: Callable[[str], Awaitable[str | None]] | None = None,
         builtin_tools: list[str] | None = None,
+        timezone: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return canonical assistant content blocks for one tool-calling turn.
+
+        ``timezone`` is the caller's IANA timezone (``None`` = unknown). A provider
+        with anything tied to local time — the Claude CLI's own date note, a web
+        search's location — uses it, never the server's clock.
 
         ``make_io`` lets the caller inject where the assistant turn and its
         lifecycle events are persisted (a flow ``EventEmitter`` or a chat

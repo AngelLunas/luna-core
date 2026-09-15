@@ -11,6 +11,7 @@ import pytest
 from luna_core.routers.conversations import (
     MAX_HANDOFF_HOPS,
     _augment_system_prompt,
+    _call_context,
     _follow_handoffs,
 )
 
@@ -195,3 +196,57 @@ async def test_augment_never_raises_on_provider_error():
         _req_with_provider(provider), None, object(), _Ag("BASE"), "q"
     )
     assert out == "BASE"  # failures degrade to the base prompt
+
+
+# --- the user's timezone in the call context --------------------------------
+
+def _req_with_timezone_hook(hook) -> SimpleNamespace:
+    state = SimpleNamespace()
+    if hook is not None:
+        state.user_timezone_provider = hook
+    return SimpleNamespace(app=SimpleNamespace(state=state))
+
+
+@pytest.mark.asyncio
+async def test_call_context_carries_the_hosts_user_timezone():
+    uid = uuid.uuid4()
+
+    async def hook(_db, user_id):
+        assert user_id == uid
+        return "America/Bogota"
+
+    ctx = await _call_context(_req_with_timezone_hook(hook), None, uid)
+    assert ctx == {"user_id": str(uid), "timezone": "America/Bogota"}
+
+
+@pytest.mark.asyncio
+async def test_call_context_without_a_hook_or_on_error_is_just_the_user():
+    uid = uuid.uuid4()
+
+    async def broken(_db, _user_id):
+        raise RuntimeError("profile down")
+
+    assert await _call_context(_req_with_timezone_hook(None), None, uid) == {"user_id": str(uid)}
+    assert await _call_context(_req_with_timezone_hook(broken), None, uid) == {"user_id": str(uid)}
+
+
+@pytest.mark.asyncio
+async def test_a_handoff_continuation_carries_the_timezone():
+    orch, doc = _Agent("orch"), _Agent("doc")
+    seq = [doc, doc]
+    seen: list = []
+
+    async def send(**kw):
+        seen.append(kw["extra_call_context"])
+        return "answer from doc"
+
+    async def resolver(_db, _convo):
+        return seq.pop(0)
+
+    async def hook(_db, _user_id):
+        return "America/Bogota"
+
+    request = _request(SimpleNamespace(send=send), resolver)
+    request.app.state.user_timezone_provider = hook
+    await _follow_handoffs(None, request, SimpleNamespace(id=uuid.uuid4()), None, uuid.uuid4(), orch, "x")
+    assert [c.get("timezone") for c in seen] == ["America/Bogota"]

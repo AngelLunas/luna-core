@@ -96,3 +96,20 @@ async def test_gives_up_after_max_retries():
     with pytest.raises(APIError):
         await _call(_router(prov, max_retries=2))
     assert prov.calls == 3  # initial + 2 retries
+
+
+@pytest.mark.asyncio
+async def test_router_hands_the_callers_timezone_to_the_provider():
+    seen: dict = {}
+
+    class _Recording:
+        async def complete(self, **kwargs):
+            seen.update(kwargs)
+            return [{"type": "text", "text": "ok"}]
+
+    await _router(_Recording()).complete(  # type: ignore[arg-type]
+        provider_id=uuid.uuid4(), messages=[], system="", tools=[], temperature=0.0,
+        model="m", output_schema=None, run_id=uuid.uuid4(), node_id="n",
+        timezone="America/Bogota",
+    )
+    assert seen["timezone"] == "America/Bogota"

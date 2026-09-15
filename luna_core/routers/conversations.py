@@ -309,7 +309,7 @@ async def send(
             system_prompt=await _augment_system_prompt(
                 request, db, conversation, agent, payload.new_message
             ),
-            extra_call_context={"user_id": str(user.id)},
+            extra_call_context=await _call_context(request, db, user.id),
             attachments=attachments,
             image_resolver=await _image_resolver(
                 request, db, conversation, agent, user.id,
@@ -447,7 +447,7 @@ async def decide_tool_approval(
         db=db,
         redis=redis,
         system_prompt=agent.instructions or None,
-        extra_call_context={"user_id": str(user.id)},
+        extra_call_context=await _call_context(request, db, user.id),
         image_resolver=await _image_resolver(
             request, db, conversation, agent, user.id
         ),
@@ -531,6 +531,27 @@ async def stream(
 
 
 # --- helpers ---
+async def _call_context(request: Request, db: Any, user_id: uuid.UUID) -> dict[str, Any]:
+    """What every tool handler and model call of a chat turn is told about the caller.
+
+    The user's timezone comes from the host's optional
+    ``app.state.user_timezone_provider`` — an async ``(db, user_id) -> str | None``
+    giving an IANA name. Providers with anything tied to local time (the Claude
+    CLI's own date note, a web search's location) follow it; left to the server's
+    clock, an evening turn is told that today is already tomorrow. A failing hook
+    never breaks the turn."""
+    context: dict[str, Any] = {"user_id": str(user_id)}
+    hook = getattr(request.app.state, "user_timezone_provider", None)
+    if hook is not None:
+        try:
+            tz = await hook(db, user_id)
+        except Exception:  # noqa: BLE001 — a timezone lookup must never break a turn
+            tz = None
+        if tz:
+            context["timezone"] = tz
+    return context
+
+
 async def _augment_system_prompt(
     request: Request,
     db: AsyncSession,
@@ -609,7 +630,7 @@ async def _follow_handoffs(
             db=db,
             redis=redis,
             system_prompt=system_prompt,
-            extra_call_context={"user_id": str(user_id)},
+            extra_call_context=await _call_context(request, db, user_id),
             image_resolver=await _image_resolver(
                 request, db, conversation, agent, user_id
             ),

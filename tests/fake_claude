@@ -32,7 +32,7 @@ index = len(existing)
 
 prompt = sys.stdin.read()
 
-record = {"argv": sys.argv[1:], "prompt": prompt}
+record = {"argv": sys.argv[1:], "prompt": prompt, "tz": os.environ.get("TZ")}
 argv = sys.argv[1:]
 if "--mcp-config" in argv:
     config_path = argv[argv.index("--mcp-config") + 1]

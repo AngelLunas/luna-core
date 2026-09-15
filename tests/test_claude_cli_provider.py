@@ -696,3 +696,23 @@ async def test_builtin_mode_cuts_the_cli_when_our_tool_is_proposed(tmp_path):
     }]
     # cut on purpose: no result event → no usage row for this call
     assert [r for r in h.added if isinstance(r, LLMUsage)] == []
+
+
+# --- the caller's timezone -------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_cli_runs_in_the_callers_timezone(tmp_path):
+    # The CLI writes its own "today's date" into the model's context from the
+    # process timezone: on a UTC container it told every evening's turn that
+    # today was already tomorrow, against the host's own date block.
+    h = _Harness(tmp_path, [[*_text_events("ok"), {"event": _result_event()}]])
+    await h.complete(timezone="America/Bogota")
+    assert h.invocation()["tz"] == "America/Bogota"
+
+
+@pytest.mark.asyncio
+async def test_cli_without_a_timezone_keeps_the_process_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("TZ", "Europe/Madrid")
+    h = _Harness(tmp_path, [[*_text_events("ok"), {"event": _result_event()}]])
+    await h.complete()
+    assert h.invocation()["tz"] == "Europe/Madrid"

@@ -276,6 +276,9 @@ class AgentRunner:
                 make_io=emitter.for_session,
                 image_resolver=image_resolver,
                 builtin_tools=list(getattr(agent, "builtin_tools", None) or []) or None,
+                # The caller's timezone (a host passes it in extra_call_context):
+                # whatever the provider ties to local time follows the user.
+                timezone=call_context.get("timezone"),
             )
 
             if _debug_llm_calls_enabled():
