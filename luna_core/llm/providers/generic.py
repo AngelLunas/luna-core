@@ -32,7 +32,7 @@ from contextlib import AbstractAsyncContextManager
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
-from openai import AsyncOpenAI, RateLimitError
+from openai import APITimeoutError, AsyncOpenAI, RateLimitError
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -531,6 +531,27 @@ def _extract_thinking_from_choice_delta(delta: Any) -> str | None:
     return None
 
 
+_FIXED_TEMPERATURE_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+
+
+def _uses_flex(model: str | None) -> bool:
+    """Whether this model's chat calls go to OpenAI's flex tier (about half
+    the price, slower). Set by ``LLM_FLEX_MODELS``; empty turns it off."""
+    wanted = {m.strip().lower() for m in (settings.llm_flex_models or "").split(",") if m.strip()}
+    return bool(model) and model.lower() in wanted
+
+
+def _fixed_temperature_model(model: str | None) -> bool:
+    """OpenAI's reasoning models (gpt-5 family, o-series) reject any
+    ``temperature`` other than the default and answer 400 to the request.
+    The agent's stored temperature is simply not sent to them; every other
+    model (gpt-4.x, gpt-5-chat-latest, Ollama, vLLM, …) keeps receiving it."""
+    name = (model or "").lower()
+    if name.startswith("gpt-5-chat"):
+        return False
+    return name.startswith(_FIXED_TEMPERATURE_PREFIXES)
+
+
 class GenericProvider:
     """OpenAI-compatible chat + embeddings provider.
 
@@ -650,18 +671,19 @@ class GenericProvider:
         delta_seq_redis_key = f"delta_seq:{run_id}:{message_id}"
         # Final-chunk token usage (when the provider honors stream_options).
         final_usage: Any = None
+        served_tier: str | None = None
 
         # Pre-resolve attached-image media_ids to renderable URLs before the
         # (sync) message builder runs. Only when a resolver is injected — the
         # text-only path (no resolver) is byte-identical to before.
         image_urls = await self._resolve_image_urls(messages, image_resolver)
 
+        resolved_model = model or self._default_model
         request: dict[str, Any] = {
-            "model": model or self._default_model,
+            "model": resolved_model,
             "messages": _canonical_to_openai_messages(
                 messages, system, image_urls or None
             ),
-            "temperature": temperature,
             "stream": True,
             # Ask the provider for a final usage-only chunk (real token counts).
             # It arrives with empty ``choices`` and is captured below; the
@@ -684,8 +706,15 @@ class GenericProvider:
                 },
             }
 
+        if not _fixed_temperature_model(resolved_model):
+            request["temperature"] = temperature
+
+        flex = _uses_flex(resolved_model)
+        if flex:
+            request["service_tier"] = "flex"
+
         try:
-            stream = await self._chat_client.chat.completions.create(**request)
+            stream = await self._open_chat_stream(request, flex=flex)
         except RateLimitError as exc:
             raise LLMRateLimitError(str(exc)) from exc
 
@@ -696,6 +725,7 @@ class GenericProvider:
                 chunk_usage = getattr(chunk, "usage", None)
                 if chunk_usage is not None:
                     final_usage = chunk_usage
+                served_tier = getattr(chunk, "service_tier", None) or served_tier
                 if not chunk.choices:
                     continue
                 # abort check FIRST — short-circuit before doing any work
@@ -800,6 +830,8 @@ class GenericProvider:
             )
             raise
 
+        if flex:
+            logger.info("chat call model=%s service_tier requested=flex served=%s", resolved_model, served_tier)
         blocks, thinking = accumulator.to_canonical()
         async with self._session_factory() as db:
             emitter = build_io(db)
@@ -839,6 +871,23 @@ class GenericProvider:
         return blocks
 
     # -------------------------------------------------------------- responses
+    async def _open_chat_stream(self, request: dict[str, Any], *, flex: bool) -> Any:
+        """Open the chat stream. On the flex tier a busy or slow provider is not
+        a failure: the same request goes out once more on the standard tier."""
+        if not flex:
+            return await self._chat_client.chat.completions.create(**request)
+        try:
+            return await self._chat_client.with_options(
+                timeout=settings.llm_flex_timeout_seconds
+            ).chat.completions.create(**request)
+        except (RateLimitError, APITimeoutError) as exc:
+            logger.warning(
+                "flex tier unavailable for %s (%s); retrying on the standard tier",
+                request.get("model"), type(exc).__name__,
+            )
+            standard = {k: v for k, v in request.items() if k != "service_tier"}
+            return await self._chat_client.chat.completions.create(**standard)
+
     async def _complete_via_responses(
         self,
         *,

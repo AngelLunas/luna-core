@@ -78,6 +78,13 @@ class Settings(BaseSettings):
     llm_max_retries: int = 3
     llm_retry_base_delay_seconds: float = 1.0
 
+    # OpenAI flex processing: about half the price, slower, sometimes busy.
+    # Comma-separated model names whose chat calls request it; empty turns it
+    # off. A call the flex tier refuses or times out goes out once more on the
+    # standard tier, so flex can cost latency but never a turn.
+    llm_flex_models: str = ""
+    llm_flex_timeout_seconds: float = 900.0
+
     # Claude Code CLI provider (kind=claude_cli rows). The binary must be
     # logged into a Claude subscription on this machine (`claude login`);
     # a row's base_url overrides the binary path per provider. Concurrency
