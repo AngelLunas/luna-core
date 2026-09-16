@@ -432,6 +432,28 @@ async def list_flow_runs(
     return list(result.scalars().all())
 
 
+async def list_runs(
+    db: AsyncSession,
+    *,
+    flow_id: uuid.UUID | None = None,
+    statuses: list[FlowRunStatus] | None = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> list[FlowRun]:
+    """Runs across every flow, newest first. Unlike ``list_flow_runs`` this
+    one does not need a flow: a dashboard showing recent activity would
+    otherwise have to ask flow by flow.
+    """
+    stmt = select(FlowRun)
+    if flow_id is not None:
+        stmt = stmt.where(FlowRun.flow_id == flow_id)
+    if statuses:
+        stmt = stmt.where(FlowRun.status.in_(statuses))
+    stmt = stmt.order_by(FlowRun.created_at.desc()).limit(limit).offset(offset)
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
 async def set_run_status(
     db: AsyncSession,
     run_id: uuid.UUID,

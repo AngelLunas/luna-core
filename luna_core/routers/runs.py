@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, HTTPException, WebSocket, status
+from fastapi import APIRouter, HTTPException, Query, WebSocket, status
 
 from luna_core.core.config import settings
 from luna_core.core.dependencies import CurrentUser, DBSession, RedisClient, get_redis_client
@@ -21,6 +21,7 @@ from luna_core.services.flow import (
     get_flow_run,
     list_run_events,
     list_run_messages,
+    list_runs,
     set_run_status,
 )
 from luna_core.tasks import resume_flow_task
@@ -41,6 +42,23 @@ def get_ws_manager() -> WebSocketManager:
             ),
         )
     return _ws_manager
+
+
+@router.get("", response_model=list[FlowRunRead])
+async def index(
+    db: DBSession,
+    _: CurrentUser,
+    flow_id: uuid.UUID | None = None,
+    status_filter: list[FlowRunStatus] | None = Query(default=None, alias="status"),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> list[FlowRunRead]:
+    """Runs across every flow, newest first. ``status`` may repeat
+    (``?status=running&status=pending``); ``flow_id`` narrows to one flow.
+    Page with ``limit``/``offset``; a page shorter than ``limit`` is the last.
+    """
+    items = await list_runs(db, flow_id=flow_id, statuses=status_filter, limit=limit, offset=offset)
+    return [FlowRunRead.model_validate(r) for r in items]
 
 
 @router.get("/{run_id}", response_model=FlowRunRead)
