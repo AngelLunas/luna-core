@@ -348,6 +348,44 @@ async def test_error_result_raises(tmp_path):
         await h.complete()
 
 
+_AFTER_TOOL_RESULTS = [
+    {"role": "user", "content": [{"type": "text", "text": "book the meeting"}]},
+    {"role": "assistant", "content": [
+        {"type": "text", "text": "Booked for Monday. Anything else?"},
+        {"type": "tool_use", "id": "toolu_1", "name": "book_meeting", "input": {}},
+    ]},
+    {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_1", "content": '{"ok": true}'},
+    ]},
+]
+
+
+@pytest.mark.asyncio
+async def test_empty_reply_after_tool_results_ends_the_turn(tmp_path):
+    """The model already spoke in the message that made the calls: an empty
+    reply to their results closes the turn instead of failing."""
+    h = _Harness(tmp_path, [[{"event": _result_event()}]])
+    blocks = await h.complete(messages=_AFTER_TOOL_RESULTS)
+    assert blocks == []
+    assert h.io.messages[-1]["content"] == []
+    assert [r for r in h.added if isinstance(r, LLMUsage)]
+    argv = h.invocation()["argv"]
+    assert "end the turn with an empty reply" in argv[argv.index("--system-prompt") + 1]
+
+
+@pytest.mark.asyncio
+async def test_empty_reply_to_user_text_still_raises(tmp_path):
+    h = _Harness(tmp_path, [[{"event": _result_event()}]])
+    with pytest.raises(RuntimeError, match="no content"):
+        await h.complete()
+    with pytest.raises(RuntimeError, match="no content"):
+        await h.complete(messages=[
+            *_AFTER_TOOL_RESULTS,
+            {"role": "assistant", "content": [{"type": "text", "text": "Done."}]},
+            {"role": "user", "content": [{"type": "text", "text": "thanks"}]},
+        ])
+
+
 @pytest.mark.asyncio
 async def test_rate_limited_result_raises_rate_limit(tmp_path):
     h = _Harness(tmp_path, [[{"event": _result_event(
@@ -492,6 +530,9 @@ def test_leak_guard_removes_reply_wrappers_and_closed_reasoning():
     doubled = reply + "\n\n&lt;/assistant>\n</thinking>\n\n" + reply
     assert _strip_leaked_transcript(doubled) == reply
     assert _strip_leaked_transcript("<thinking>pienso</thinking>\n" + reply) == reply
+    # a history tag closed mid-line: the model ended its reply as transcript
+    assert _strip_leaked_transcript("¿En qué etapa están?</user>") == "¿En qué etapa están?"
+    assert _strip_leaked_transcript(reply + "\n</latest>") == reply
     # prose that only mentions a word like "assistant" is untouched
     prose = "Tu asistente (assistant) quedó configurado."
     assert _strip_leaked_transcript(prose) == prose

@@ -91,7 +91,10 @@ tool calls you made and their real results) followed by a <latest> block: what \
 you must respond to now (new user text, or results of tools you just called). \
 Treat both as context only. Your reply is ONLY your next assistant message: \
 natural prose for the user and/or real tool calls. Never write history tags, \
-never narrate tool calls or invent tool results as text — call the tool."""
+never narrate tool calls or invent tool results as text — call the tool. \
+When <latest> holds only the results of your own calls and your last message \
+already told the user what they need, end the turn with an empty reply — write \
+nothing more."""
 
 # Any of these at the start of a line means the model began "writing the
 # transcript" instead of replying; everything from there on is discarded.
@@ -117,6 +120,19 @@ _BUILTIN_TOOL_MAP: dict[str, tuple[str, ...]] = {
 }
 _CLI_WEB_SEARCH_TOOL = "WebSearch"
 _CLI_WEB_FETCH_TOOL = "WebFetch"
+
+
+def _ends_with_tool_results(messages: list[dict[str, Any]]) -> bool:
+    """True when the canonical history ends with a message made only of tool
+    results — the model is answering its own calls, not new user text."""
+    if not messages or messages[-1].get("role") != "user":
+        return False
+    content = messages[-1].get("content")
+    return (
+        isinstance(content, list)
+        and bool(content)
+        and all(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+    )
 
 
 def _xml_escape(text: str) -> str:
@@ -245,6 +261,13 @@ _WRAPPER_TAG = re.compile(r"(?:<|&lt;)/?(?:assistant|final_answer|answer|respons
 # opening tag in sight, and the real reply after it.
 _REASONING_CLOSE = re.compile(r"(?:<|&lt;)/(?:thinking|reasoning)>", re.IGNORECASE)
 _REASONING_OPEN = re.compile(r"(?:<|&lt;)(?:thinking|reasoning)>", re.IGNORECASE)
+# A history tag CLOSED mid-line — the model finished its reply as if it were
+# writing the transcript ("…¿en qué etapa están?</user>"). Only the closing
+# form: prose may legitimately mention <user> or <latest>.
+_HISTORY_CLOSE = re.compile(
+    r"(?:<|&lt;)/(?:user|latest|conversation_history|tool_call|tool_result)>",
+    re.IGNORECASE,
+)
 
 
 def _strip_leaked_transcript(text: str) -> str:
@@ -267,6 +290,7 @@ def _strip_leaked_transcript(text: str) -> str:
         cleaned = after if after.strip() else _REASONING_CLOSE.sub("", cleaned)
     cleaned = _REASONING_OPEN.sub("", cleaned)
     cleaned = _WRAPPER_TAG.sub("", cleaned)
+    cleaned = _HISTORY_CLOSE.sub("", cleaned)
     if cleaned == text:
         return text
     return cleaned.strip()
@@ -369,6 +393,10 @@ class ClaudeCLIProvider(GenericProvider):
             messages, system="", image_urls=image_urls or None
         )
         prompt = _render_transcript(openai_msgs)
+        # After tool results the model may end the turn with nothing to add:
+        # its earlier message already spoke. Forcing words there makes it
+        # repeat itself or narrate the protocol.
+        may_end_empty = _ends_with_tool_results(messages)
         if prompt.startswith("<"):
             system = (system or "") + _HISTORY_PROTOCOL
         stdin_payload = _stream_json_user_message(
@@ -399,6 +427,7 @@ class ClaudeCLIProvider(GenericProvider):
                     argv=argv,
                     stdin_payload=stdin_payload,
                     stop_on_proposal=bool(cli_tools),
+                    may_end_empty=may_end_empty,
                     work_dir=work_dir,
                     output_schema=output_schema,
                     model=model,
@@ -484,6 +513,7 @@ class ClaudeCLIProvider(GenericProvider):
         stdin_payload: str,
         stop_on_proposal: bool,
         work_dir: str,
+        may_end_empty: bool = False,
         output_schema: dict[str, Any] | None,
         model: str,
         run_id: uuid.UUID,
@@ -594,7 +624,7 @@ class ClaudeCLIProvider(GenericProvider):
             if "rate limit" in message.lower() or "overloaded" in message.lower():
                 raise LLMRateLimitError(message)
             raise RuntimeError(f"claude-cli error ({subtype}): {message}")
-        if not blocks:
+        if not blocks and not may_end_empty:
             raise RuntimeError(
                 f"claude-cli returned no content (subtype={subtype})"
             )
