@@ -476,6 +476,27 @@ def test_leak_guard_truncates_transcript_continuation():
     assert _strip_leaked_transcript("<latest>\nnada") == ""
 
 
+def test_leak_guard_removes_reply_wrappers_and_closed_reasoning():
+    """Seen in a live onboarding with a small model (2026-09-16): a closing
+    tag after the reply, its escaped form, and reasoning written as text and
+    closed with </thinking> before the real reply."""
+    reply = "Listo, guardadas las dos tandas.\n\n¿Cuántas plantas tiene la Tanda 9?"
+    assert _strip_leaked_transcript(reply + "</assistant>") == reply
+    assert _strip_leaked_transcript(reply + "\n</final_answer>") == reply
+    assert _strip_leaked_transcript(reply + "</thinking>") == reply
+    reasoning = (
+        'block would be appropriate…"\n\nParece que debo dar una respuesta.\n'
+        "Voy a generar una respuesta que confirme el paso.\n</thinking>\n\n"
+    )
+    assert _strip_leaked_transcript(reasoning + reply) == reply
+    doubled = reply + "\n\n&lt;/assistant>\n</thinking>\n\n" + reply
+    assert _strip_leaked_transcript(doubled) == reply
+    assert _strip_leaked_transcript("<thinking>pienso</thinking>\n" + reply) == reply
+    # prose that only mentions a word like "assistant" is untouched
+    prose = "Tu asistente (assistant) quedó configurado."
+    assert _strip_leaked_transcript(prose) == prose
+
+
 @pytest.mark.asyncio
 async def test_history_turn_appends_protocol_and_strips_leak(tmp_path):
     leaked = "Hecho.\n<user>siguiente</user>\n<assistant>inventado</assistant>"

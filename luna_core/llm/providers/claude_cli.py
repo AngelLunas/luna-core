@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import logging
 import os
 import shutil
@@ -236,8 +237,21 @@ def _stream_json_user_message(text: str, images: list[str]) -> str:
     ) + "\n"
 
 
+# The reply's own wrappers, which a small model imitates from the transcript
+# (every earlier turn is shown to it as <assistant>…</assistant>): a closing
+# tag left after the reply, or its escaped form (&lt;/assistant>).
+_WRAPPER_TAG = re.compile(r"(?:<|&lt;)/?(?:assistant|final_answer|answer|response|reply)>", re.IGNORECASE)
+# Reasoning written as reply text and closed with a tag — often with no
+# opening tag in sight, and the real reply after it.
+_REASONING_CLOSE = re.compile(r"(?:<|&lt;)/(?:thinking|reasoning)>", re.IGNORECASE)
+_REASONING_OPEN = re.compile(r"(?:<|&lt;)(?:thinking|reasoning)>", re.IGNORECASE)
+
+
 def _strip_leaked_transcript(text: str) -> str:
-    """Cut an assistant text at the first line that starts a history tag."""
+    """What the caller may read of an assistant text: cut at the first line
+    that starts a history tag; reasoning closed with a tag dropped (what
+    follows the last closing tag is the reply; with nothing after it, the tag
+    alone goes); and the reply's own wrapper tags removed."""
     cut = len(text)
     for marker in _LEAK_MARKERS:
         idx = text.find(marker)
@@ -246,7 +260,16 @@ def _strip_leaked_transcript(text: str) -> str:
                 cut = idx
                 break
             idx = text.find(marker, idx + 1)
-    return text[:cut].rstrip() if cut < len(text) else text
+    cleaned = text[:cut] if cut < len(text) else text
+    closes = list(_REASONING_CLOSE.finditer(cleaned))
+    if closes:
+        after = cleaned[closes[-1].end():]
+        cleaned = after if after.strip() else _REASONING_CLOSE.sub("", cleaned)
+    cleaned = _REASONING_OPEN.sub("", cleaned)
+    cleaned = _WRAPPER_TAG.sub("", cleaned)
+    if cleaned == text:
+        return text
+    return cleaned.strip()
 
 
 def _usage_shim(usage: dict[str, Any]) -> Any:
