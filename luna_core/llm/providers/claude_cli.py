@@ -92,9 +92,10 @@ you must respond to now (new user text, or results of tools you just called). \
 Treat both as context only. Your reply is ONLY your next assistant message: \
 natural prose for the user and/or real tool calls. Never write history tags, \
 never narrate tool calls or invent tool results as text — call the tool. \
-When <latest> holds only the results of your own calls and your last message \
-already told the user what they need, end the turn with an empty reply — write \
-nothing more."""
+When <latest> holds only the results of your own calls, your last message \
+already told the user everything they need, and nothing your instructions ask \
+of this turn is still owed, end the turn with an empty reply — write nothing \
+more. When something is still owed, this reply is where it goes."""
 
 # Any of these at the start of a line means the model began "writing the
 # transcript" instead of replying; everything from there on is discarded.
