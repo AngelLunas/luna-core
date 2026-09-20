@@ -33,6 +33,7 @@ BASE_ARGS = [
     "--tools", "",
     "--no-session-persistence",
     "--strict-mcp-config",
+    "--setting-sources", "",
     "--exclude-dynamic-system-prompt-sections",
 ]
 

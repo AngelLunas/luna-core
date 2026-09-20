@@ -468,6 +468,13 @@ class ClaudeCLIProvider(GenericProvider):
             "--include-partial-messages",
             "--no-session-persistence",
             "--strict-mcp-config",
+            # Nothing of the operator's own Claude Code install belongs in a
+            # server turn: every input is passed explicitly below, and loading
+            # their settings (with whatever plugins and skills sit beside them)
+            # costs most of a second on each call for nothing. The subscription
+            # login is read separately and still applies.
+            "--setting-sources",
+            "",
         ]
         if cli_tools:
             # Builtin tools (web search) execute INSIDE the CLI and each one

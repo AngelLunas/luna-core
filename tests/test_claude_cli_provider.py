@@ -268,6 +268,9 @@ async def test_tool_use_turn_strips_prefix_and_ships_catalog(tmp_path):
     }]
     inv = h.invocation()
     assert "--strict-mcp-config" in inv["argv"]
+    # the operator's own settings (and the plugins beside them) stay out
+    argv = inv["argv"]
+    assert argv[argv.index("--setting-sources") + 1] == ""
     # the catalog server was configured with exactly the turn's tools
     assert inv["tools_file"] == [{
         "name": "water_plant",
