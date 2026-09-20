@@ -27,6 +27,7 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 import uuid
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
@@ -440,6 +441,7 @@ class ClaudeCLIProvider(GenericProvider):
                     s_key=s_key,
                     d_key=d_key,
                     timezone=timezone,
+                    tool_count=len(tools),
                 )
             finally:
                 shutil.rmtree(work_dir, ignore_errors=True)
@@ -525,6 +527,7 @@ class ClaudeCLIProvider(GenericProvider):
         s_key: str,
         d_key: str,
         timezone: str | None = None,
+        tool_count: int = 0,
     ) -> list[dict[str, Any]]:
         # The CLI must bill the subscription login, never an API key that
         # happens to be in the backend's environment.
@@ -534,6 +537,7 @@ class ClaudeCLIProvider(GenericProvider):
         # today is already tomorrow, against the host's own date block.
         if timezone:
             env["TZ"] = timezone
+        spawned_at = time.perf_counter()
         proc = await asyncio.create_subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.PIPE,
@@ -545,6 +549,7 @@ class ClaudeCLIProvider(GenericProvider):
         assert proc.stdin is not None and proc.stdout is not None
 
         state = _TurnState(stop_on_proposal=stop_on_proposal)
+        state.spawned_at = spawned_at
         aborted = asyncio.Event()
 
         async def _watch_abort() -> None:
@@ -662,6 +667,21 @@ class ClaudeCLIProvider(GenericProvider):
                 )
             await db.commit()
         await redis.delete(s_key, d_key, inflight_meta_key(run_id, message_id))
+        # Where one call's wall time goes: process start → the model's first
+        # output (text, thinking or a tool proposal) → the end of the call.
+        logger.info(
+            "claude-cli call — scope=%s node=%s model=%s tools=%d prompt_chars=%d "
+            "first_output=%s total=%.2fs",
+            run_id,
+            node_id,
+            model,
+            tool_count,
+            len(stdin_payload),
+            f"{state.first_output_after:.2f}s"
+            if state.first_output_after is not None
+            else "none",
+            time.perf_counter() - spawned_at,
+        )
         return blocks
 
     async def _consume_stream(
@@ -917,6 +937,7 @@ class ClaudeCLIProvider(GenericProvider):
     ) -> None:
         if state.message_started:
             return
+        state.first_output_after = time.perf_counter() - state.spawned_at
         started_seq = await self._emit(
             build_io,
             run_id,
@@ -951,6 +972,10 @@ class _TurnState:
         self.web_searches: dict[str, str | None] = {}
         self.web_fetches: dict[str, str | None] = {}
         self.message_started = False
+        # Timing, for the per-call log line: when the process was started and
+        # how long the model's first output took from there.
+        self.spawned_at = 0.0
+        self.first_output_after: float | None = None
         self.delta_seq_base = 0
         self.text_chunk_index = 0
         self.thinking_chunk_index = 0

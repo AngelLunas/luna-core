@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -170,6 +171,31 @@ async def _resolve_agent(
     return await resolver(db, conversation)
 
 
+class _TurnTiming:
+    """Wall time of one turn, split by phase, for a single log line. Marks are
+    cumulative checkpoints; the line reports each phase's own share."""
+
+    def __init__(self) -> None:
+        self._start = self._last = time.perf_counter()
+        self._phases: list[tuple[str, float]] = []
+
+    def mark(self, phase: str) -> None:
+        now = time.perf_counter()
+        self._phases.append((phase, now - self._last))
+        self._last = now
+
+    def log(self, conversation_id: uuid.UUID, agent: Agent, status: str) -> None:
+        phases = " ".join(f"{name}={spent:.2f}s" for name, spent in self._phases)
+        logger.info(
+            "chat turn timing — conversation=%s agent=%s status=%s %s total=%.2fs",
+            conversation_id,
+            agent.name,
+            status,
+            phases,
+            time.perf_counter() - self._start,
+        )
+
+
 @dataclass
 class MeteringContext:
     """Passed to the optional ``chat_metering_hook`` after each turn. ``usage``
@@ -286,6 +312,8 @@ async def send(
         )
     runner = _chat_runner(request)
     resolver = _agent_resolver(request)
+    # Where the turn's wall time goes, phase by phase — one log line per turn.
+    timing = _TurnTiming()
     # The turn's live channel, up before the agent is even chosen — a
     # routing-aware resolver emits routing_started/routing_decided on it so
     # the client can show the decision phase ahead of the first token.
@@ -293,6 +321,7 @@ async def send(
     agent = await _resolve_agent(
         resolver, db, conversation, query=payload.new_message, io=io
     )
+    timing.mark("route")
 
     # Clear any stale abort flag from a prior turn (the key lingers for its TTL
     # and is never auto-cleared) so it can't kill this fresh turn.
@@ -300,34 +329,46 @@ async def send(
 
     attachments = payload.attachment_blocks() or None
     try:
+        system_prompt = await _augment_system_prompt(
+            request, db, conversation, agent, payload.new_message
+        )
+        timing.mark("context")
+        extra_call_context = await _call_context(request, db, user.id)
+        image_resolver = await _image_resolver(
+            request, db, conversation, agent, user.id,
+            media_ids=payload.attachment_media_ids(),
+        )
+        timing.mark("prepare")
         result = await runner.send(
             agent=agent,
             conversation_id=conversation_id,
             new_message=payload.new_message,
             db=db,
             redis=redis,
-            system_prompt=await _augment_system_prompt(
-                request, db, conversation, agent, payload.new_message
-            ),
-            extra_call_context=await _call_context(request, db, user.id),
+            system_prompt=system_prompt,
+            extra_call_context=extra_call_context,
             attachments=attachments,
-            image_resolver=await _image_resolver(
-                request, db, conversation, agent, user.id,
-                media_ids=payload.attachment_media_ids(),
-            ),
+            image_resolver=image_resolver,
         )
+        timing.mark("run")
+        first_agent = agent
         agent, result = await _follow_handoffs(
             db, request, conversation, redis, user.id, agent, result,
             query=payload.new_message,
         )
+        if agent.id != first_agent.id:
+            timing.mark("handoff")
     except AbortSignalError:
         # The user stopped the turn. The provider persisted the streamed-so-far
         # text as a PARTIAL message; promote it to final so it stays in the thread
         # (list_messages hides partials). Clear the flag for the next turn.
         await redis.delete(abort_key(conversation_id))
         await finalize_partial_messages(db, conversation_id)
+        timing.log(conversation_id, agent, "aborted")
         return SendMessageResponse(conversation_id=conversation_id, status="aborted")
     response = await _turn_response(db, request, conversation_id, agent, user.id, result)
+    timing.mark("respond")
+    timing.log(conversation_id, agent, response.status)
     _maybe_spawn_auto_title(
         request, conversation_id, conversation.user_id, agent, response, needs_title
     )
