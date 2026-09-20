@@ -9,9 +9,14 @@ anything. A ``tools/call`` should be unreachable (the provider never allowlists
 these tools, so the CLI auto-denies before calling); if one arrives anyway it
 returns an error result rather than pretending to run the tool.
 
-Run as a module (the CLI spawns it per ``--mcp-config``):
+Run as a script, by path (the CLI spawns it per ``--mcp-config``):
 
-    python -m luna_core.llm.providers.mcp_catalog /path/to/tools.json
+    python -I /path/to/luna_core/llm/providers/mcp_catalog.py /path/to/tools.json
+
+By path and not with ``-m``: ``-m`` imports every parent package first, and
+those pull in the whole engine — seconds of startup on a small machine, paid
+before every model call, for a server that needs none of it. ``-I`` keeps this
+file's directory off ``sys.path`` so a sibling can never shadow the stdlib.
 
 The file holds ``[{"name", "description", "input_schema"}, ...]`` — the wire
 shape of ``ToolDefinition``. Only stdlib is used: the subprocess must start
@@ -20,6 +25,7 @@ fast and never depend on the host app's collaborators.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from typing import Any
 
@@ -34,10 +40,18 @@ def build_mcp_config(tools_file: str) -> dict[str, Any]:
         "mcpServers": {
             MCP_SERVER_NAME: {
                 "command": sys.executable,
-                "args": ["-m", __name__, tools_file],
+                "args": [*_launch_args(), tools_file],
             }
         }
     }
+
+
+def _launch_args() -> list[str]:
+    """How to start this server: by file path when the source is a real file
+    (see the module docstring), as a module otherwise (a zipped install)."""
+    if os.path.isfile(__file__):
+        return ["-I", os.path.abspath(__file__)]
+    return ["-m", __name__]
 
 
 def _load_tools(path: str) -> list[dict[str, Any]]:

@@ -2,17 +2,21 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from typing import Any
 
+from luna_core.llm.providers import mcp_catalog
 from luna_core.llm.providers.mcp_catalog import build_mcp_config
 
 
 def _speak(tools_file: str, requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
     payload = "".join(json.dumps(r) + "\n" for r in requests)
+    # Started exactly as the CLI starts it: from the config the provider writes.
+    server = build_mcp_config(tools_file)["mcpServers"]["luna"]
     proc = subprocess.run(
-        [sys.executable, "-m", "luna_core.llm.providers.mcp_catalog", tools_file],
+        [server["command"], *server["args"]],
         input=payload,
         capture_output=True,
         text=True,
@@ -55,10 +59,30 @@ def test_catalog_serves_tools_and_refuses_calls(tmp_path):
     assert call["isError"] is True
 
 
-def test_build_mcp_config_spawns_this_module(tmp_path):
+def test_build_mcp_config_spawns_this_file_by_path(tmp_path):
+    # By path, never ``-m``: ``-m`` imports the parent packages (the whole
+    # engine) before a server that only needs the stdlib.
     config = build_mcp_config("/tmp/tools.json")
     server = config["mcpServers"]["luna"]
     assert server["command"] == sys.executable
     assert server["args"] == [
-        "-m", "luna_core.llm.providers.mcp_catalog", "/tmp/tools.json",
+        "-I", os.path.abspath(mcp_catalog.__file__), "/tmp/tools.json",
     ]
+
+
+def test_catalog_starts_without_importing_the_package(tmp_path):
+    tools_file = tmp_path / "tools.json"
+    tools_file.write_text("[]")
+    server = build_mcp_config(str(tools_file))["mcpServers"]["luna"]
+    probe = (
+        "import runpy, sys; sys.argv = sys.argv[1:]; sys.stdin = open(__import__('os').devnull); "
+        "runpy.run_path(sys.argv[0], run_name='__main__'); "
+        "print(sorted(m for m in sys.modules if m.split('.')[0] == 'luna_core'))"
+    )
+    script, tools = server["args"][-2:]
+    proc = subprocess.run(
+        [sys.executable, "-I", "-c", probe, script, tools],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "[]"

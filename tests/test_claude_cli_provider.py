@@ -275,7 +275,7 @@ async def test_tool_use_turn_strips_prefix_and_ships_catalog(tmp_path):
         "input_schema": {"type": "object", "properties": {}},
     }]
     server = inv["mcp_config"]["mcpServers"]["luna"]
-    assert server["args"][0:2] == ["-m", "luna_core.llm.providers.mcp_catalog"]
+    assert server["args"][-2].endswith("mcp_catalog.py")  # by path, not -m
 
 
 @pytest.mark.asyncio
