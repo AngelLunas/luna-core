@@ -9,6 +9,7 @@ overrides per call when needed (e.g. multi-tenant deployments).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from typing import Any
@@ -28,8 +29,21 @@ class MCPClient:
         *,
         timeout: float = 30.0,
         auth_headers: dict[str, str] | None = None,
+        connect_attempts: int | None = None,
+        connect_backoff_seconds: float | None = None,
     ):
         self._base_url = (base_url or settings.mcp_server_url).rstrip("/")
+        self._connect_attempts = max(
+            1,
+            settings.mcp_connect_attempts
+            if connect_attempts is None
+            else connect_attempts,
+        )
+        self._connect_backoff = (
+            settings.mcp_connect_backoff_seconds
+            if connect_backoff_seconds is None
+            else connect_backoff_seconds
+        )
         # follow_redirects: fastmcp's streamable-http handler returns a 307
         # from /mcp to /mcp/ (Starlette trailing-slash normalization).
         # The Accept header is required by fastmcp 2.x — it rejects `*/*`
@@ -90,7 +104,7 @@ class MCPClient:
             "params": params,
         }
         try:
-            response = await self._client.post("/mcp", json=envelope)
+            response = await self._post_with_connect_retry(envelope)
             response.raise_for_status()
         except httpx.HTTPError as exc:
             raise MCPTransportError(f"MCP transport failed: {exc}") from exc
@@ -101,6 +115,34 @@ class MCPClient:
                 f"MCP {method} failed: {error.get('message', 'unknown error')}"
             )
         return body.get("result", {})
+
+    async def _post_with_connect_retry(self, envelope: dict[str, Any]) -> httpx.Response:
+        """POST the envelope, waiting out a server that is not listening yet."""
+        delay = self._connect_backoff
+        for attempt in range(1, self._connect_attempts + 1):
+            try:
+                return await self._client.post("/mcp", json=envelope)
+            except _CONNECT_FAILURES as exc:
+                if attempt == self._connect_attempts:
+                    raise
+                logger.warning(
+                    "MCP server unreachable at %s (attempt %d/%d): %s — retrying in %.1fs",
+                    self._base_url,
+                    attempt,
+                    self._connect_attempts,
+                    exc,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                delay *= 2
+        raise AssertionError("unreachable")  # pragma: no cover
+
+
+# Only failures that never established a connection: the server was not
+# listening, so this request never reached it and cannot have taken effect.
+# Anything that did reach the server (a timeout mid-call, a 5xx) is NOT
+# retried here — a repeated `tools/call` would run the tool's writes twice.
+_CONNECT_FAILURES = (httpx.ConnectError, httpx.ConnectTimeout)
 
 
 def _flatten_content_blocks(blocks: list[dict[str, Any]]) -> Any:

@@ -143,6 +143,13 @@ class Settings(BaseSettings):
 
     # MCP Server
     mcp_server_url: str = "http://localhost:8765"
+    # A worker that boots beside the MCP server can reach it before it listens
+    # (process start order is not a contract). Retry only failures that never
+    # established a connection, so the request cannot have run twice: these
+    # many attempts, sleeping base * 2^n between them (0.5 + 1 + 2 + 4 + 8 =
+    # 15.5s over 6 attempts). Set attempts to 1 to fail on the first refusal.
+    mcp_connect_attempts: int = 6
+    mcp_connect_backoff_seconds: float = 0.5
 
     # OAuth2 (authorization_code) callback URL — the dashboard hosts a page at
     # this URL that finishes the handshake. Must match what's registered in
