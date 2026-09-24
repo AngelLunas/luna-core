@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import jwt
-from fastapi import APIRouter, HTTPException, Request, Response, WebSocket, status
+from fastapi import APIRouter, HTTPException, Request, Response, WebSocket, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from luna_core.core.db import AsyncSessionLocal
@@ -219,8 +219,13 @@ async def create(
 
 
 @router.get("", response_model=list[ConversationRead])
-async def index(db: DBSession, user: CurrentUser) -> list[ConversationRead]:
-    rows = await list_conversations(db, user_id=user.id)
+async def index(
+    db: DBSession,
+    user: CurrentUser,
+    limit: int | None = Query(None, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+) -> list[ConversationRead]:
+    rows = await list_conversations(db, user_id=user.id, limit=limit, offset=offset)
     return [ConversationRead.model_validate(c) for c in rows]
 
 

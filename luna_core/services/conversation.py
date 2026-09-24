@@ -33,13 +33,22 @@ async def create_conversation(
 
 
 async def list_conversations(
-    db: AsyncSession, *, user_id: uuid.UUID
+    db: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> list[Conversation]:
-    result = await db.execute(
+    """The user's conversations, most recently touched first. With limit
+    the caller reads one page; a page shorter than limit is the last one."""
+    stmt = (
         select(Conversation)
         .where(Conversation.user_id == user_id)
         .order_by(Conversation.updated_at.desc())
     )
+    if limit is not None:
+        stmt = stmt.limit(limit).offset(offset)
+    result = await db.execute(stmt)
     return list(result.scalars().all())
 
 
