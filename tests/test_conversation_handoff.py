@@ -188,6 +188,24 @@ async def test_augment_skips_when_no_query_or_empty_context():
 
 
 @pytest.mark.asyncio
+async def test_augment_consults_provider_when_query_is_none():
+    # A resumed turn (after an approval) and a handoff carry no new user
+    # text, yet the host context still belongs in the prompt: the provider
+    # is consulted with ``query=None`` and decides for itself.
+    seen: list[object] = []
+
+    async def provider(_db, _conv, _agent, query):
+        seen.append(query)
+        return "CTX"
+
+    out = await _augment_system_prompt(
+        _req_with_provider(provider), None, object(), _Ag("BASE"), None
+    )
+    assert out == "BASE\n\nCTX"
+    assert seen == [None]
+
+
+@pytest.mark.asyncio
 async def test_augment_never_raises_on_provider_error():
     async def provider(_db, _conv, _agent, _query):
         raise RuntimeError("retrieval down")

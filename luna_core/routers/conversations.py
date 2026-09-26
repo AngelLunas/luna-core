@@ -487,12 +487,18 @@ async def decide_tool_approval(
     agent = await _resolve_agent(
         resolver, db, conversation, io=ConversationIO(db, redis, conversation_id)
     )
+    # The resumed call gets the same host context a fresh turn gets (date,
+    # place, memory, the card a linked conversation is about): the model's
+    # closing message after an approval must not forget where it is. ``None``
+    # query, as on a handoff — the provider decides what it needs it for.
     result = await runner.resume(
         agent=agent,
         conversation_id=conversation_id,
         db=db,
         redis=redis,
-        system_prompt=agent.instructions or None,
+        system_prompt=await _augment_system_prompt(
+            request, db, conversation, agent, None
+        ),
         extra_call_context=await _call_context(request, db, user.id),
         image_resolver=await _image_resolver(
             request, db, conversation, agent, user.id
