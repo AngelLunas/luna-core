@@ -124,6 +124,27 @@ _CLI_WEB_SEARCH_TOOL = "WebSearch"
 _CLI_WEB_FETCH_TOOL = "WebFetch"
 
 
+async def _stdout_lines(stream: asyncio.StreamReader):
+    """The CLI's stream-json lines, whatever their length.
+
+    ``async for raw in stream`` reads with ``readline``, which refuses a line
+    longer than the reader's buffer limit (64 KiB by default) — and the CLI
+    writes a whole message as ONE line, so a long answer or a large tool call
+    killed the turn. Any fixed limit only moves that wall; reading in chunks
+    and splitting here has none.
+    """
+    buf = bytearray()
+    while chunk := await stream.read(65536):
+        scanned = len(buf)
+        buf += chunk
+        while (end := buf.find(b"\n", scanned)) != -1:
+            yield bytes(buf[:end])
+            del buf[: end + 1]
+            scanned = 0
+    if buf:
+        yield bytes(buf)
+
+
 def _ends_with_tool_results(messages: list[dict[str, Any]]) -> bool:
     """True when the canonical history ends with a message made only of tool
     results — the model is answering its own calls, not new user text."""
@@ -705,7 +726,7 @@ class ClaudeCLIProvider(GenericProvider):
         d_key: str,
     ) -> None:
         assert proc.stdout is not None
-        async for raw in proc.stdout:
+        async for raw in _stdout_lines(proc.stdout):
             line = raw.strip()
             if not line:
                 continue

@@ -439,6 +439,17 @@ async def test_abort_kills_process_and_saves_partial(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_a_line_longer_than_the_reader_limit_is_read_whole(tmp_path):
+    # The CLI writes a message as one line; asyncio's readline refuses any
+    # line over 64 KiB ("Separator is found, but chunk is longer than limit").
+    long_text = "palabra " * 100_000  # ~800 KiB on a single line
+    h = _Harness(tmp_path, [[*_text_events(long_text), {"event": _result_event()}]])
+    blocks = await h.complete()
+
+    assert blocks == [{"type": "text", "text": long_text}]
+
+
+@pytest.mark.asyncio
 async def test_timeout_kills_process(tmp_path):
     scenario = [[{"sleep": 30}]]
     h = _Harness(tmp_path, scenario)
