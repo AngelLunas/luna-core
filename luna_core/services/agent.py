@@ -243,7 +243,7 @@ async def preview_instructions(
 ) -> InstructionsPreviewOut:
     """Render an agent's instruction template using live context loaders.
 
-    Resolution mirrors the engine's `_format_template` so the preview matches
+    Resolution mirrors the engine's `format_template` so the preview matches
     what the agent would see at run time. Each referenced source is loaded
     against a synthetic state that stamps `state.trigger.user_id` from the
     authenticated user — matching how the trigger router seeds runs in
@@ -340,7 +340,7 @@ async def preview_instructions(
 def _render_template(
     text: str, state: dict[str, Any], *, missing: dict[str, Any]
 ) -> str:
-    """Mirror of `engine.nodes._format_template`, but emits an explicit
+    """Mirror of `engine.nodes.format_template`, but emits an explicit
     `[unresolved <source>]` marker for `${context.<x>...}` refs whose
     source didn't load — so the preview surfaces the gap instead of
     silently producing an empty string the way the engine does.

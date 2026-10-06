@@ -32,12 +32,17 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from luna_core.engine.agent import AgentRunner, SuspendedForApproval
+from luna_core.engine.agent import (
+    AgentRunner,
+    SuspendedForApproval,
+    build_system_prompt,
+)
 from luna_core.engine.emitter import (
     _EMIT_MAX_RETRIES,
     max_seq_key,
     publish_run_event,
 )
+from luna_core.engine.nodes import format_template, load_agent_context
 from luna_core.engine.streaming import SupportsSequence
 from luna_core.llm.router import LLMRouter
 from luna_core.mcp.client import MCPClient
@@ -214,6 +219,42 @@ class ChatRunner:
     ) -> None:
         self._runner = AgentRunner(
             llm_router, mcp_client, system_tool_registry=system_tool_registry
+        )
+
+    async def system_prompt(
+        self,
+        *,
+        agent: Agent,
+        db: AsyncSession,
+        redis: Redis,
+        state: dict[str, Any] | None = None,
+        context_bindings: dict[str, Any] | None = None,
+    ) -> str:
+        """The agent's system prompt as an ``ai_agent`` node would build it:
+        its ``required_sources`` loaded (``context_bindings`` as on a node;
+        implicit sources read ``state``, e.g. ``state["trigger"]["user_id"]``)
+        and every ``${...}`` in its role and instructions resolved.
+
+        The caller may append to the result before passing it to
+        :meth:`send` as ``system_prompt``."""
+        enriched = dict(state or {})
+        loaded = await load_agent_context(
+            agent,
+            bindings=context_bindings or {},
+            state=enriched,
+            db=db,
+            redis=redis,
+            label=f"chat agent {agent.name!r}",
+        )
+        enriched["context"] = {**(enriched.get("context") or {}), **loaded}
+        return build_system_prompt(
+            agent,
+            role=format_template(agent.role, enriched) if agent.role else "",
+            instructions=(
+                format_template(agent.instructions, enriched)
+                if agent.instructions
+                else ""
+            ),
         )
 
     async def send(
