@@ -9,7 +9,7 @@ import pytest
 
 from luna_core.engine.nodes import (
     NodeExecutionError,
-    _format_template,
+    format_template,
     _resolve_binding_id,
     _resolve_value,
 )
@@ -17,7 +17,7 @@ from luna_core.engine.nodes import (
 
 def test_format_template_substitutes_context_path():
     state = {"context": {"profile": {"name": "Angel", "rate": 45}}}
-    out = _format_template(
+    out = format_template(
         "Hi ${context.profile.name}, rate ${context.profile.rate}", state
     )
     assert out == "Hi Angel, rate 45"
@@ -28,7 +28,7 @@ def test_format_template_substitutes_inputs_and_trigger():
         "inputs": {"profile_id": "abc"},
         "trigger": {"source": "manual"},
     }
-    out = _format_template(
+    out = format_template(
         "id=${inputs.profile_id} via=${trigger.source}", state
     )
     assert out == "id=abc via=manual"
@@ -38,7 +38,7 @@ def test_format_template_missing_path_becomes_empty_string():
     state = {"context": {"profile": {"name": "Angel"}}}
     # missing drill-down inside a loaded dict: silent empty (matches the doc
     # — only the top-level binding is fail-hard, intra-dict misses are soft).
-    out = _format_template("missing=${context.profile.unknown}", state)
+    out = format_template("missing=${context.profile.unknown}", state)
     assert out == "missing="
 
 

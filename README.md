@@ -917,7 +917,7 @@ references in `instructions`):
 | DELETE | `/{id}` | `flows:delete` (→ `204`) |
 | GET | `/{id}/runs` | `flows:read` — `?limit=20&offset=0` |
 | POST | `/{id}/run` | — (→ `202`) |
-| WS | `/{id}/stream` | — |
+| WS | `/{id}/stream` | `flows:read` — access token as `?token=` or `Authorization: Bearer` (refused with 1008 / handshake 403) |
 
 **`POST /flows`** — `{ "name": "...", "description": "...", "definition": { …FlowDefinition… }, "is_active": true }`
 (see [Flow definition format](#flow-definition-format)). Returns `FlowRead` with the
@@ -955,7 +955,7 @@ Returns `202` with the pending `FlowRunRead` (and enqueues `run_flow_task`):
 | POST | `/{run_id}/resume` | → `202` |
 | POST | `/{run_id}/abort` | → `202` |
 | DELETE | `/{run_id}` | Soft-compact (purge events+messages, keep row) |
-| WS | `/{run_id}/stream` | Snapshot + live event/message stream |
+| WS | `/{run_id}/stream` | Snapshot + live event/message stream. Access token as `?token=` or `Authorization: Bearer` (refused with 1008 / handshake 403) |
 
 **`GET /runs/{run_id}/events`** → `RunEventRead[]` ordered by `sequence`:
 ```json

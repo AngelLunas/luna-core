@@ -134,3 +134,38 @@ async def test_run_sub_agent_uses_fresh_scope_and_returns_output(monkeypatch):
     assert captured["new_message"] == "analyze this plant"
     assert captured["history"] == []
     assert captured["emitter"].scope_id == result.scope_id
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_loads_context_and_resolves_templates():
+    from types import SimpleNamespace
+
+    from luna_core.services.context_sources import register_context_source
+
+    seen: dict[str, Any] = {}
+
+    async def load_profile(ctx, source_id):
+        seen["user_id"] = ctx.state["trigger"]["user_id"]
+        seen["source_id"] = source_id
+        return {"name": "Ada"}
+
+    register_context_source(
+        name="profile", description="p", loader=load_profile, id_implicit=True
+    )
+    agent = SimpleNamespace(
+        name="Reviser",
+        role="Writes for ${context.profile.name}",
+        instructions="Profile: ${context.profile.name}. Missing: [${context.nope.x}]",
+        required_sources=["profile"],
+        output_schema=None,
+    )
+    runner = ChatRunner(llm_router=None, mcp_client=None)
+    prompt = await runner.system_prompt(
+        agent=agent,
+        db=None,
+        redis=None,
+        state={"trigger": {"user_id": "u-1"}},
+    )
+    assert prompt == "Role: Writes for Ada\n\nProfile: Ada. Missing: []"
+    # Implicit sources read the caller's state, as on a flow node.
+    assert seen == {"user_id": "u-1", "source_id": None}

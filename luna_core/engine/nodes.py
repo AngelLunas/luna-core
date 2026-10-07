@@ -396,10 +396,10 @@ class NodeExecutor:
 
         new_message = _resolve_prompt(node.config, enriched_state)
         resolved_role = (
-            _format_template(agent.role, enriched_state) if agent.role else ""
+            format_template(agent.role, enriched_state) if agent.role else ""
         )
         resolved_instructions = (
-            _format_template(agent.instructions, enriched_state)
+            format_template(agent.instructions, enriched_state)
             if agent.instructions
             else ""
         )
@@ -634,10 +634,10 @@ class NodeExecutor:
 
             new_message = _resolve_prompt(node.config, enriched_state)
             resolved_role = (
-                _format_template(agent.role, enriched_state) if agent.role else ""
+                format_template(agent.role, enriched_state) if agent.role else ""
             )
             resolved_instructions = (
-                _format_template(agent.instructions, enriched_state)
+                format_template(agent.instructions, enriched_state)
                 if agent.instructions
                 else ""
             )
@@ -1111,12 +1111,12 @@ class NodeExecutor:
 
                     new_message = _resolve_prompt(node.config, enriched_state)
                     resolved_role = (
-                        _format_template(agent.role, enriched_state)
+                        format_template(agent.role, enriched_state)
                         if agent.role
                         else ""
                     )
                     resolved_instructions = (
-                        _format_template(agent.instructions, enriched_state)
+                        format_template(agent.instructions, enriched_state)
                         if agent.instructions
                         else ""
                     )
@@ -1258,64 +1258,16 @@ class NodeExecutor:
         node: FlowNode,
         state: dict[str, Any],
     ) -> dict[str, dict[str, Any]]:
-        """Resolve every source named in ``agent.required_sources`` against
-        ``node.config.context_bindings`` and return ``{name: loaded_dict}``.
-
-        Failures (unknown source, missing/unresolvable binding, loader raising)
-        are converted to ``NodeExecutionError`` so the run halts with a clear
-        message — declared bindings are treated as load-bearing.
-        """
-        required = list(getattr(agent, "required_sources", None) or [])
-        if not required:
-            return {}
-
-        bindings_raw = node.config.get("context_bindings") or {}
-        if not isinstance(bindings_raw, dict):
-            raise NodeExecutionError(
-                f"ai_agent node {node.id}: context_bindings must be an object"
-            )
-
-        loaded: dict[str, dict[str, Any]] = {}
-        load_ctx = SourceLoadContext(db=self._db, redis=self._redis, state=state)
-        for name in required:
-            try:
-                source = get_context_source(name)
-            except UnknownSourceError as exc:
-                raise NodeExecutionError(
-                    f"ai_agent node {node.id}: agent requires context source "
-                    f"{name!r} but no such source is registered"
-                ) from exc
-
-            if source.id_implicit:
-                source_id: str | None = None
-            else:
-                binding = bindings_raw.get(name)
-                if not isinstance(binding, dict):
-                    raise NodeExecutionError(
-                        f"ai_agent node {node.id}: missing context_bindings entry "
-                        f"for required source {name!r}"
-                    )
-                source_id = _resolve_binding_id(binding, state)
-                if source_id is None or source_id == "":
-                    raise NodeExecutionError(
-                        f"ai_agent node {node.id}: binding for source "
-                        f"{name!r} resolved to no id (binding={binding!r})"
-                    )
-
-            try:
-                data = await source.loader(load_ctx, source_id)
-            except Exception as exc:  # noqa: BLE001 — loader errors are domain errors
-                raise NodeExecutionError(
-                    f"ai_agent node {node.id}: loader for context source "
-                    f"{name!r} failed: {exc}"
-                ) from exc
-            if not isinstance(data, dict):
-                raise NodeExecutionError(
-                    f"ai_agent node {node.id}: loader for {name!r} returned "
-                    f"{type(data).__name__}, expected dict"
-                )
-            loaded[name] = data
-        return loaded
+        """Load ``agent.required_sources`` for ``node`` (see
+        :func:`load_agent_context`)."""
+        return await load_agent_context(
+            agent,
+            bindings=node.config.get("context_bindings") or {},
+            state=state,
+            db=self._db,
+            redis=self._redis,
+            label=f"ai_agent node {node.id}",
+        )
 
     async def _run_condition(
         self, node: FlowNode, state: dict[str, Any]
@@ -1536,6 +1488,75 @@ def _result_preview(result: Any, *, limit: int) -> str:
     return text[:limit] + "…"
 
 
+async def load_agent_context(
+    agent: Agent,
+    *,
+    bindings: Any,
+    state: dict[str, Any],
+    db: AsyncSession,
+    redis: Redis,
+    label: str = "agent",
+) -> dict[str, dict[str, Any]]:
+    """Resolve every source named in ``agent.required_sources`` against
+    ``bindings`` (a node's ``context_bindings``) and return
+    ``{name: loaded_dict}``.
+
+    Failures (unknown source, missing/unresolvable binding, loader raising)
+    are converted to ``NodeExecutionError`` prefixed with ``label`` so the
+    caller halts with a clear message — declared bindings are treated as
+    load-bearing. Public so a chat host (``ChatRunner``) gives an agent the
+    same context an ``ai_agent`` node would.
+    """
+    required = list(getattr(agent, "required_sources", None) or [])
+    if not required:
+        return {}
+
+    if not isinstance(bindings, dict):
+        raise NodeExecutionError(f"{label}: context_bindings must be an object")
+
+    loaded: dict[str, dict[str, Any]] = {}
+    load_ctx = SourceLoadContext(db=db, redis=redis, state=state)
+    for name in required:
+        try:
+            source = get_context_source(name)
+        except UnknownSourceError as exc:
+            raise NodeExecutionError(
+                f"{label}: agent requires context source "
+                f"{name!r} but no such source is registered"
+            ) from exc
+
+        if source.id_implicit:
+            source_id: str | None = None
+        else:
+            binding = bindings.get(name)
+            if not isinstance(binding, dict):
+                raise NodeExecutionError(
+                    f"{label}: missing context_bindings entry "
+                    f"for required source {name!r}"
+                )
+            source_id = _resolve_binding_id(binding, state)
+            if source_id is None or source_id == "":
+                raise NodeExecutionError(
+                    f"{label}: binding for source "
+                    f"{name!r} resolved to no id (binding={binding!r})"
+                )
+
+        try:
+            data = await source.loader(load_ctx, source_id)
+        except Exception as exc:  # noqa: BLE001 — loader errors are domain errors
+            raise NodeExecutionError(
+                f"{label}: loader for context source "
+                f"{name!r} failed: {exc}"
+            ) from exc
+        if not isinstance(data, dict):
+            raise NodeExecutionError(
+                f"{label}: loader for {name!r} returned "
+                f"{type(data).__name__}, expected dict"
+            )
+        loaded[name] = data
+    return loaded
+
+
 def _resolve_binding_id(binding: dict[str, Any], state: dict[str, Any]) -> str | None:
     """Resolve a ``context_bindings`` entry to a string id.
 
@@ -1584,12 +1605,13 @@ def _resolve_prompt(config: dict[str, Any], state: dict[str, Any]) -> str | None
     if prompt is None:
         return None
     if isinstance(prompt, str):
-        return _format_template(prompt, state)
+        return format_template(prompt, state)
     return str(prompt)
 
 
-def _format_template(text: str, state: dict[str, Any]) -> str:
-    # Lightweight ${path} substitution; missing paths become empty strings.
+def format_template(text: str, state: dict[str, Any]) -> str:
+    """Lightweight ``${path}`` substitution against ``state``; missing paths
+    become empty strings. The same resolution every agent prompt gets."""
     result = text
     cursor = 0
     while True:
