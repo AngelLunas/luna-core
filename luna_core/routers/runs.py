@@ -5,7 +5,13 @@ import uuid
 from fastapi import APIRouter, HTTPException, Query, WebSocket, status
 
 from luna_core.core.config import settings
-from luna_core.core.dependencies import CurrentUser, DBSession, RedisClient, get_redis_client
+from luna_core.core.dependencies import (
+    CurrentUser,
+    DBSession,
+    RedisClient,
+    authenticate_websocket,
+    get_redis_client,
+)
 from luna_core.engine.emitter import EventEmitter
 from luna_core.engine.websocket import WebSocketManager
 from luna_core.llm.base import abort_key
@@ -205,6 +211,10 @@ async def clear(
 
 
 @router.websocket("/{run_id}/stream")
-async def stream(websocket: WebSocket, run_id: uuid.UUID) -> None:
+async def stream(websocket: WebSocket, run_id: uuid.UUID, token: str | None = None) -> None:
+    """The run's live events, for the same users the REST reads admit."""
+    if await authenticate_websocket(websocket, token) is None:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
     manager = get_ws_manager()
     await manager.connect(run_id, websocket)

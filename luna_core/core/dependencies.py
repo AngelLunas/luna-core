@@ -2,13 +2,13 @@ import uuid
 from typing import Annotated
 
 import jwt
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, HTTPException, Request, WebSocket, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from luna_core.core.config import settings
-from luna_core.core.db import get_db
+from luna_core.core.db import AsyncSessionLocal, get_db
 from luna_core.core.redis import get_redis
 from luna_core.core.security import decode_access_token
 from luna_core.models.user import User
@@ -95,6 +95,45 @@ async def get_current_user(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="email_not_verified",
         )
+    return user
+
+
+async def authenticate_websocket(
+    websocket: WebSocket, token: str | None, *, permission: str | None = None
+) -> User | None:
+    """The user behind a WebSocket, under the same rules as ``CurrentUser``:
+    an access token, an active user and, when the host requires it, a
+    verified email; with ``permission``, also what ``require_permission``
+    checks on the matching REST reads. The token comes as ``?token=`` (browsers can't set
+    headers on a WebSocket) or an ``Authorization: Bearer`` header (any other
+    client). None on any failure: the caller closes the socket with 1008
+    before accepting it, which the client sees as a 403 on the handshake.
+    """
+    if not token:
+        scheme, _, value = (websocket.headers.get("authorization") or "").partition(" ")
+        token = value.strip() if scheme.lower() == "bearer" else None
+    if not token:
+        return None
+    try:
+        payload = decode_access_token(token)
+    except jwt.InvalidTokenError:
+        return None
+    if payload.get("type") != "access":
+        return None
+    try:
+        user_id = uuid.UUID(payload.get("sub"))
+    except (TypeError, ValueError):
+        return None
+    from luna_core.services.permission import has_permission
+
+    async with AsyncSessionLocal() as db:
+        user = await db.get(User, user_id)
+        if user is None or not user.is_active:
+            return None
+        if settings.email_verification_required and not user.is_verified:
+            return None
+        if permission is not None and not await has_permission(user, permission, db):
+            return None
     return user
 
 
