@@ -665,4 +665,7 @@ async def test_fast_model_is_the_newest_active_model_of_the_fast_line():
             info("s-newest", "sonnet", 10),
         ],
     )
-    assert await _provider(client).fast_model() == "h-new"
+    provider = _provider(client)
+    assert await provider.fast_model() == "h-new"
+    assert await provider.latest_model("sonnet") == "s-newest"
+    assert await provider.latest_model("opus") is None

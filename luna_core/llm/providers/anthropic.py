@@ -389,7 +389,7 @@ class AnthropicProvider(StreamingTurnProvider):
             api_key=api_key or "missing", base_url=base_url or None
         )
         self._specs: dict[str, tuple[float, _ModelSpec]] = {}
-        self._fast_model: tuple[float, str | None] | None = None
+        self._latest: dict[str, tuple[float, str | None]] = {}
 
     # ------------------------------------------------------------ models API
     async def _spec(self, model: str) -> _ModelSpec:
@@ -402,26 +402,29 @@ class AnthropicProvider(StreamingTurnProvider):
         self._specs[model] = (now, spec)
         return spec
 
-    async def fast_model(self) -> str | None:
-        """The newest active model of the fast ("haiku") line, as the Models
-        API lists it — for side calls that need an answer, not depth."""
+    async def latest_model(self, line: str) -> str | None:
+        """The newest active model of a model line ("haiku", "sonnet", "opus",
+        …) as the Models API lists it; None when the line lists none."""
         now = time.monotonic()
-        if (
-            self._fast_model is not None
-            and now - self._fast_model[0] < settings.anthropic_capabilities_ttl_seconds
-        ):
-            return self._fast_model[1]
+        cached = self._latest.get(line)
+        if cached is not None and now - cached[0] < settings.anthropic_capabilities_ttl_seconds:
+            return cached[1]
         best: Any = None
         async for info in self._client.models.list():
-            if getattr(info, "line", None) != "haiku":
+            if getattr(info, "line", None) != line:
                 continue
             if getattr(info, "lifecycle", "active") != "active":
                 continue
             if best is None or info.created_at > best.created_at:
                 best = info
         model = best.id if best is not None else None
-        self._fast_model = (now, model)
+        self._latest[line] = (now, model)
         return model
+
+    async def fast_model(self) -> str | None:
+        """The fast line's newest model — for side calls that need an answer,
+        not depth."""
+        return await self.latest_model("haiku")
 
     # ------------------------------------------------------------------ chat
     async def complete(
