@@ -113,3 +113,93 @@ async def test_router_hands_the_callers_timezone_to_the_provider():
         timezone="America/Bogota",
     )
     assert seen["timezone"] == "America/Bogota"
+
+
+@pytest.mark.asyncio
+async def test_router_hands_the_agents_reasoning_effort_to_the_provider():
+    seen: dict = {}
+
+    class _Recording:
+        async def complete(self, **kwargs):
+            seen.update(kwargs)
+            return [{"type": "text", "text": "ok"}]
+
+    await _router(_Recording()).complete(  # type: ignore[arg-type]
+        provider_id=uuid.uuid4(), messages=[], system="", tools=[], temperature=0.0,
+        model="m", output_schema=None, run_id=uuid.uuid4(), node_id="n",
+        reasoning_effort="high",
+    )
+    assert seen["reasoning_effort"] == "high"
+
+
+def _anthropic_status(status: int) -> Exception:
+    import anthropic
+    import httpx2
+
+    response = httpx2.Response(status, request=httpx2.Request("POST", "https://api.test"))
+    return anthropic.APIStatusError("e", response=response, body=None)
+
+
+@pytest.mark.asyncio
+async def test_retries_anthropic_overloaded_and_bare_stream_errors():
+    import anthropic
+    import httpx2
+
+    bare = anthropic.APIError("overloaded", httpx2.Request("POST", "https://api.test"), body=None)
+    prov = _FakeProvider([_anthropic_status(529), bare, None])
+    assert await _call(_router(prov)) == [{"type": "text", "text": "ok"}]
+    assert prov.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_does_not_retry_anthropic_4xx():
+    import anthropic
+
+    prov = _FakeProvider([_anthropic_status(400), None])
+    with pytest.raises(anthropic.APIStatusError):
+        await _call(_router(prov))
+    assert prov.calls == 1
+
+
+def test_router_builds_the_anthropic_provider_for_its_kind():
+    from types import SimpleNamespace
+
+    from luna_core.llm.providers.anthropic import AnthropicProvider
+
+    row = SimpleNamespace(
+        kind="anthropic", base_url="https://api.anthropic.com", chat_url=None,
+        api_key_encrypted=None,
+    )
+    built = LLMRouter(redis=None, session_factory=None)._build_provider(row)  # type: ignore[arg-type]
+    assert isinstance(built, AnthropicProvider)
+
+
+@pytest.mark.asyncio
+async def test_fast_model_asks_the_provider_when_the_kind_has_none():
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    rows = {
+        "cli": SimpleNamespace(kind="claude_cli"),
+        "api": SimpleNamespace(kind="anthropic"),
+    }
+
+    @asynccontextmanager
+    async def session():
+        yield SimpleNamespace(get=lambda _model, pid: _async(rows[pid]))
+
+    async def _async(value):
+        return value
+
+    class _Api:
+        async def fast_model(self):
+            return "listed-fast-model"
+
+    router = LLMRouter(redis=None, session_factory=session)
+
+    async def _resolve(_pid):
+        return _Api()
+
+    router.resolve_chat_provider = _resolve  # type: ignore[assignment]
+    assert await router.fast_model("cli") == "haiku"  # type: ignore[arg-type]
+    assert await router.fast_model("api") == "listed-fast-model"  # type: ignore[arg-type]

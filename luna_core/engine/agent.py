@@ -279,6 +279,7 @@ class AgentRunner:
                 # The caller's timezone (a host passes it in extra_call_context):
                 # whatever the provider ties to local time follows the user.
                 timezone=call_context.get("timezone"),
+                reasoning_effort=getattr(agent, "reasoning_effort", None),
             )
 
             if _debug_llm_calls_enabled():

@@ -2,7 +2,7 @@
 
 Providers are stored in the database (`core.llm_providers`) — the router
 opens a short-lived session per call to resolve the row, caches the built
-`GenericProvider` keyed by `(provider_id, updated_at)`, and rebuilds on
+provider (by the row's ``kind``) keyed by `(provider_id, updated_at)`, and rebuilds on
 the first call after any provider edit. Embeddings live on a dedicated
 env-configured provider since most installs use a single embedding model.
 
@@ -19,7 +19,8 @@ from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from openai import APIError
+import anthropic
+import openai
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,6 +32,7 @@ from luna_core.llm.base import (
     LLMRateLimitError,
     ToolDefinition,
 )
+from luna_core.llm.kinds import PROVIDER_KINDS
 from luna_core.llm.providers.generic import GenericProvider
 from luna_core.models.llm_provider import LLMProvider
 from luna_core.services.llm_provider import get_decrypted_api_key
@@ -56,6 +58,19 @@ def _normalize_chat_base_url(url: str) -> str:
     if stripped.endswith(suffix):
         return stripped[: -len(suffix)]
     return url
+
+
+def _transient_status(exc: Exception) -> tuple[bool, int | None]:
+    """Whether a provider SDK error is worth retrying, and its HTTP status.
+
+    Transient: a 5xx (Anthropic's 529 "overloaded" included), a connection or
+    timeout, or an error object the provider streams *inside* a 200 response,
+    which the SDKs surface as a bare API error with no status. 4xx client
+    errors are not — they won't fix on retry."""
+    if not isinstance(exc, (openai.APIError, anthropic.APIError)):
+        return False, None
+    status = getattr(exc, "status_code", None)
+    return status is None or status >= 500, status
 
 
 class LLMRouter:
@@ -100,6 +115,21 @@ class LLMRouter:
             self._chat_cache[provider_id] = (row.updated_at, provider)
             return provider
 
+    async def fast_model(self, provider_id: uuid.UUID) -> str | None:
+        """A cheap, fast model this provider can run, for side calls that need
+        an answer, not depth (a routing classifier, a title): the kind's fixed
+        one when it has one, else whatever the provider itself names (an API
+        provider asks its models listing). None → the host picks."""
+        async with self._session_factory() as db:
+            row = await db.get(LLMProvider, provider_id)
+        if row is None:
+            return None
+        spec = PROVIDER_KINDS.get(row.kind)
+        if spec is not None and spec.fast_model:
+            return spec.fast_model
+        ask = getattr(await self.resolve_chat_provider(provider_id), "fast_model", None)
+        return await ask() if callable(ask) else None
+
     def _build_provider(self, row: LLMProvider) -> BaseLLMProvider:
         if row.kind == "claude_cli":
             # Local Claude Code binary on subscription auth. base_url holds
@@ -108,6 +138,10 @@ class LLMRouter:
 
             return ClaudeCLIProvider(binary_path=row.base_url)
         api_key = get_decrypted_api_key(row)
+        if row.kind == "anthropic":
+            from luna_core.llm.providers.anthropic import AnthropicProvider
+
+            return AnthropicProvider(api_key=api_key, base_url=row.base_url)
         base_url_for_sdk = _normalize_chat_base_url(row.chat_url or row.base_url)
         # Embeddings on chat providers are unused — `embed()` always goes
         # through `self._embedding_provider` — but GenericProvider always
@@ -134,6 +168,7 @@ class LLMRouter:
         image_resolver: Callable[[str], Any] | None = None,
         builtin_tools: list[str] | None = None,
         timezone: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> list[dict[str, Any]]:
         attempt = 0
         last_exc: Exception | None = None
@@ -155,6 +190,7 @@ class LLMRouter:
                     image_resolver=image_resolver,
                     builtin_tools=builtin_tools,
                     timezone=timezone,
+                    reasoning_effort=reasoning_effort,
                 )
             except AbortSignalError:
                 raise
@@ -172,13 +208,9 @@ class LLMRouter:
                     delay,
                 )
                 await asyncio.sleep(delay)
-            except APIError as exc:
-                # Transient provider/server failure — a 5xx, a connection/timeout,
-                # or an error object a gateway (e.g. OpenRouter) streams *inside* a
-                # 200 response, which the SDK surfaces as a bare APIError mid-stream.
-                # 4xx client errors are NOT retried — they won't fix on retry.
-                status = getattr(exc, "status_code", None)
-                if status is not None and status < 500:
+            except Exception as exc:
+                transient, status = _transient_status(exc)
+                if not transient:
                     raise
                 last_exc = exc
                 attempt += 1

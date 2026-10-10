@@ -44,6 +44,7 @@ async def create_agent(db: AsyncSession, payload: AgentCreate) -> Agent:
         llm_provider_id=payload.llm_provider_id,
         model=payload.model,
         temperature=payload.temperature,
+        reasoning_effort=payload.reasoning_effort,
         output_schema=payload.output_schema,
         required_sources=extract_context_sources(payload.instructions),
     )

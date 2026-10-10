@@ -160,6 +160,8 @@ async def list_upstream_models(
     kind=claude_cli providers have no HTTP upstream: the curated alias list
     is returned instead (aliases resolve to the newest model of each family,
     so nothing goes stale), in the same shape the UI already consumes.
+    kind=anthropic providers list through the Anthropic SDK (its auth header
+    and pagination differ from the OpenAI shape).
     """
     if provider.kind == "claude_cli":
         from luna_core.llm.providers.claude_cli import CLAUDE_CLI_MODELS
@@ -168,6 +170,8 @@ async def list_upstream_models(
             LLMProviderModel(id=m["id"], owned_by="anthropic", label=m["label"])
             for m in CLAUDE_CLI_MODELS
         ]
+    if provider.kind == "anthropic":
+        return await _list_anthropic_models(provider, timeout_seconds)
     url = provider.models_url or _join_url(provider.base_url, "models")
     headers: dict[str, str] = {}
     api_key = get_decrypted_api_key(provider)
@@ -207,3 +211,22 @@ async def list_upstream_models(
 
 def _join_url(base: str, path: str) -> str:
     return f"{base.rstrip('/')}/{path.lstrip('/')}"
+
+
+async def _list_anthropic_models(
+    provider: LLMProvider, timeout_seconds: float
+) -> list[LLMProviderModel]:
+    import anthropic
+
+    client = anthropic.AsyncAnthropic(
+        api_key=get_decrypted_api_key(provider) or "missing",
+        base_url=provider.base_url,
+        timeout=timeout_seconds,
+    )
+    try:
+        return [
+            LLMProviderModel(id=m.id, owned_by="anthropic", label=m.display_name)
+            async for m in client.models.list()
+        ]
+    except anthropic.APIError as exc:
+        raise LLMProviderUpstreamError(str(exc)) from exc

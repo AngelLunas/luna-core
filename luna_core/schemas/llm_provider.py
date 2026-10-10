@@ -9,7 +9,9 @@ from pydantic import BaseModel, ConfigDict, Field
 # "openai_compatible": HTTP chat-completions (GenericProvider).
 # "claude_cli": local Claude Code binary on subscription auth — base_url is
 # the binary path, api_key is unused, models come from a curated alias list.
-LLMProviderKind = Literal["openai_compatible", "claude_cli"]
+# "anthropic": the Anthropic Messages API — base_url is the API root
+# (https://api.anthropic.com), models come from its /v1/models.
+LLMProviderKind = Literal["openai_compatible", "anthropic", "claude_cli"]
 
 
 class LLMProviderCreate(BaseModel):

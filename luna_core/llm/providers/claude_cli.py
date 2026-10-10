@@ -31,7 +31,6 @@ import time
 import uuid
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 from redis.asyncio import Redis
@@ -48,11 +47,13 @@ from luna_core.llm.base import (
     stream_key,
 )
 from luna_core.engine.emitter import publish_run_event
-from luna_core.llm.providers.generic import (
-    GenericProvider,
+from luna_core.llm.providers._turn import (
     ImageResolver,
-    _canonical_to_openai_messages,
+    StreamingTurnProvider,
+    _anthropic_usage_shim,
+    _data_url_to_image_block,
 )
+from luna_core.llm.providers.generic import _canonical_to_openai_messages
 from luna_core.llm.providers.mcp_catalog import (
     TOOL_NAME_PREFIX,
     build_mcp_config,
@@ -248,21 +249,6 @@ def _collect_images(openai_msgs: list[dict[str, Any]]) -> list[str]:
     return images
 
 
-def _data_url_to_image_block(url: str) -> dict[str, Any] | None:
-    """``data:<media_type>;base64,<data>`` → an Anthropic image content block.
-    Non-data URLs are skipped (the CLI has no way to fetch them for us)."""
-    if not url.startswith("data:"):
-        return None
-    header, sep, data = url.partition(",")
-    if not sep or ";base64" not in header:
-        return None
-    media_type = header[len("data:"):].split(";", 1)[0] or "image/png"
-    return {
-        "type": "image",
-        "source": {"type": "base64", "media_type": media_type, "data": data},
-    }
-
-
 def _stream_json_user_message(text: str, images: list[str]) -> str:
     """The one stdin line for ``--input-format stream-json``: a user message
     whose content is the prompt text plus any attached images."""
@@ -319,22 +305,6 @@ def _strip_leaked_transcript(text: str) -> str:
     return cleaned.strip()
 
 
-def _usage_shim(usage: dict[str, Any]) -> Any:
-    """Adapt the CLI result event's Anthropic-shaped usage dict to the
-    OpenAI-attribute shape ``record_usage`` reads."""
-    input_tokens = int(usage.get("input_tokens") or 0)
-    cache_read = int(usage.get("cache_read_input_tokens") or 0)
-    cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
-    output_tokens = int(usage.get("output_tokens") or 0)
-    prompt_tokens = input_tokens + cache_read + cache_creation
-    return SimpleNamespace(
-        prompt_tokens=prompt_tokens,
-        completion_tokens=output_tokens,
-        total_tokens=prompt_tokens + output_tokens,
-        prompt_tokens_details=SimpleNamespace(cached_tokens=cache_read),
-    )
-
-
 def _resolved_model(result_event: dict[str, Any], requested: str) -> str:
     """Prefer the canonical model the CLI reports (aliases resolve to a real
     model id); the busiest ``modelUsage`` entry is the main model — the CLI
@@ -350,14 +320,12 @@ def _resolved_model(result_event: dict[str, Any], requested: str) -> str:
     return best or requested
 
 
-class ClaudeCLIProvider(GenericProvider):
+class ClaudeCLIProvider(StreamingTurnProvider):
     """Chat provider backed by the local Claude Code CLI binary.
 
-    Subclasses ``GenericProvider`` purely to reuse its emit/stream/partial-save
-    plumbing (``_emit``, ``_push_stream``, ``_write_inflight_meta``,
-    ``_next_delta_sequence``, ``_save_partial_blocks``) — the HTTP clients the
-    parent builds are never used for chat, and ``embed()`` stays on the parent
-    (the router routes embeddings to its dedicated env provider anyway).
+    The turn lifecycle (events, deltas, partial saves) comes from
+    ``StreamingTurnProvider``; embeddings are not this provider's job (the
+    router sends them to its dedicated embedding provider).
     """
 
     def __init__(
@@ -394,6 +362,7 @@ class ClaudeCLIProvider(GenericProvider):
         image_resolver: ImageResolver | None = None,
         builtin_tools: list[str] | None = None,
         timezone: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> list[dict[str, Any]]:
         cli_tools: list[str] = []
         for name in builtin_tools or []:
@@ -445,6 +414,7 @@ class ClaudeCLIProvider(GenericProvider):
                     cli_tools=cli_tools,
                     output_schema=output_schema,
                     work_dir=work_dir,
+                    reasoning_effort=reasoning_effort,
                 )
                 return await self._run_turn(
                     argv=argv,
@@ -477,6 +447,7 @@ class ClaudeCLIProvider(GenericProvider):
         cli_tools: list[str],
         output_schema: dict[str, Any] | None,
         work_dir: str,
+        reasoning_effort: str | None = None,
     ) -> list[str]:
         argv = [
             self._binary,
@@ -515,6 +486,9 @@ class ClaudeCLIProvider(GenericProvider):
             system or "",
             "--exclude-dynamic-system-prompt-sections",
         ]
+        if reasoning_effort:
+            # The CLI takes the same level names as REASONING_EFFORTS.
+            argv += ["--effort", reasoning_effort]
         if tools:
             tools_file = os.path.join(work_dir, "tools.json")
             with open(tools_file, "w", encoding="utf-8") as f:
@@ -691,7 +665,7 @@ class ClaudeCLIProvider(GenericProvider):
                     scope_id=run_id,
                     message_id=message_id,
                     model=_resolved_model(result, model),
-                    usage=_usage_shim(usage),
+                    usage=_anthropic_usage_shim(usage),
                 )
             await db.commit()
         await redis.delete(s_key, d_key, inflight_meta_key(run_id, message_id))

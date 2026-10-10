@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from luna_core.schemas.connector import OperationRead
+
+# Mirrors luna_core.llm.base.REASONING_EFFORTS. None = the model's default.
+ReasoningEffort = Literal["low", "medium", "high", "xhigh", "max"]
 
 
 class AgentCreate(BaseModel):
@@ -16,6 +19,7 @@ class AgentCreate(BaseModel):
     llm_provider_id: uuid.UUID
     model: str = Field(min_length=1, max_length=255)
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    reasoning_effort: ReasoningEffort | None = None
     output_schema: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -25,6 +29,8 @@ class AgentUpdate(BaseModel):
     llm_provider_id: uuid.UUID | None = None
     model: str | None = None
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    # Explicit null clears it back to the model's default.
+    reasoning_effort: ReasoningEffort | None = None
     output_schema: dict[str, Any] | None = None
 
 
@@ -38,6 +44,7 @@ class AgentRead(BaseModel):
     llm_provider_id: uuid.UUID
     model: str
     temperature: float
+    reasoning_effort: ReasoningEffort | None = None
     output_schema: dict[str, Any] = Field(default_factory=dict)
     required_sources: list[str] = Field(default_factory=list)
     created_at: datetime

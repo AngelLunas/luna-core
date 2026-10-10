@@ -223,9 +223,22 @@ def test_every_provider_takes_the_callers_timezone():
     import inspect
 
     from luna_core.llm.base import BaseLLMProvider
+    from luna_core.llm.providers.anthropic import AnthropicProvider
     from luna_core.llm.providers.claude_cli import ClaudeCLIProvider
     from luna_core.llm.providers.generic import GenericProvider
     from luna_core.llm.router import LLMRouter
 
-    for impl in (BaseLLMProvider, GenericProvider, ClaudeCLIProvider, LLMRouter):
-        assert "timezone" in inspect.signature(impl.complete).parameters, impl.__name__
+    impls = (BaseLLMProvider, GenericProvider, ClaudeCLIProvider, AnthropicProvider, LLMRouter)
+    for impl in impls:
+        params = inspect.signature(impl.complete).parameters
+        assert "timezone" in params, impl.__name__
+        assert "reasoning_effort" in params, impl.__name__
+
+
+def test_openai_effort_only_for_reasoning_models_and_capped_at_high():
+    from luna_core.llm.providers.generic import _openai_effort
+
+    assert _openai_effort("gpt-5.4", "medium") == "medium"
+    assert _openai_effort("o3", "max") == "high"
+    assert _openai_effort("gpt-4.1", "high") is None
+    assert _openai_effort("gpt-5.4", None) is None

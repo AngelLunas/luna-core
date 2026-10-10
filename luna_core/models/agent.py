@@ -51,6 +51,10 @@ class Agent(Base):
     builtin_tools: Mapped[list[str]] = mapped_column(
         ARRAY(Text), nullable=False, server_default="{}"
     )
+    # How hard the model thinks before answering: one of REASONING_EFFORTS
+    # (luna_core.llm.base). NULL → the model's own default. Each provider maps
+    # the level onto its model's control, or ignores it where there is none.
+    reasoning_effort: Mapped[str | None] = mapped_column(String(16), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

@@ -792,3 +792,12 @@ async def test_cli_without_a_timezone_keeps_the_process_environment(tmp_path, mo
     h = _Harness(tmp_path, [[*_text_events("ok"), {"event": _result_event()}]])
     await h.complete()
     assert h.invocation()["tz"] == "Europe/Madrid"
+
+
+def test_reasoning_effort_rides_the_effort_flag(tmp_path):
+    provider = ClaudeCLIProvider(binary_path="claude")
+    common = dict(model="sonnet", system="s", tools=[], cli_tools=[], output_schema=None,
+                  work_dir=str(tmp_path))
+    argv = provider._build_argv(**common, reasoning_effort="xhigh")
+    assert argv[argv.index("--effort") + 1] == "xhigh"
+    assert "--effort" not in provider._build_argv(**common)

@@ -26,8 +26,8 @@ class ProviderKindSpec:
     vision: bool | None = None
     # A cheap, fast model every provider of this kind can run — for side calls
     # that need an answer, not depth (a routing classifier, a title). None when
-    # the kind cannot promise one (a generic HTTP row serves whatever its host
-    # lists) and the host must supply a model id of its own.
+    # the kind cannot promise a fixed one: the provider may still name one at
+    # runtime (``LLMRouter.fast_model``), else the host supplies its own id.
     fast_model: str | None = None
 
 
@@ -36,6 +36,15 @@ PROVIDER_KINDS: dict[str, ProviderKindSpec] = {
     for spec in (
         ProviderKindSpec(
             kind="openai_compatible", label=None, requires_api_key=True
+        ),
+        ProviderKindSpec(
+            kind="anthropic",
+            label="Anthropic API",
+            requires_api_key=True,
+            vision=True,
+            # Asked of the Models API instead (LLMRouter.fast_model), so a
+            # new model generation needs no code change.
+            fast_model=None,
         ),
         ProviderKindSpec(
             kind="claude_cli",

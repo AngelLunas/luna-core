@@ -51,6 +51,23 @@ class LLMRateLimitError(RuntimeError):
     """Provider returned 429 / rate-limited. Router may retry with backoff."""
 
 
+class LLMRefusalError(RuntimeError):
+    """The model declined the request on policy grounds (and any fallback the
+    provider tried declined too). Not retried: the same request would be
+    declined again. ``category`` is the provider's reason, when it gives one."""
+
+    def __init__(self, message: str, category: str | None = None):
+        super().__init__(message)
+        self.category = category
+
+
+# How hard a model should think before answering, from cheapest to deepest.
+# Provider-agnostic: each provider maps a level onto what its model accepts
+# (and ignores it where the model has no such control). ``None`` everywhere
+# means "the model's own default".
+REASONING_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+
+
 class BaseLLMProvider(Protocol):
     async def complete(
         self,
@@ -67,8 +84,17 @@ class BaseLLMProvider(Protocol):
         image_resolver: Callable[[str], Awaitable[str | None]] | None = None,
         builtin_tools: list[str] | None = None,
         timezone: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return canonical assistant content blocks for one tool-calling turn.
+
+        ``reasoning_effort`` is one of ``REASONING_EFFORTS`` (``None`` = the
+        model's default); a provider maps it to its own control or ignores it.
+
+        A provider may attach a ``native`` key to a block it returns: its own
+        wire form of that block, which it replays verbatim when the block comes
+        back in history (signed reasoning, server-side tool results). Other
+        providers ignore the key.
 
         ``timezone`` is the caller's IANA timezone (``None`` = unknown). A provider
         with anything tied to local time — the Claude CLI's own date note, a web
@@ -142,6 +168,8 @@ __all__ = [
     "AbortSignalError",
     "BaseLLMProvider",
     "LLMRateLimitError",
+    "LLMRefusalError",
+    "REASONING_EFFORTS",
     "ToolDefinition",
     "abort_key",
     "delta_event_id",

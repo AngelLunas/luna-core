@@ -98,6 +98,14 @@ class Settings(BaseSettings):
     # still ends the call immediately, whatever the cap.
     claude_cli_builtin_max_turns: int = 8
 
+    # Anthropic API provider (kind=anthropic rows). What each model accepts
+    # (thinking types, effort levels, server tools, output cap, fallbacks) is
+    # read from the Models API and kept this long before asking again.
+    anthropic_capabilities_ttl_seconds: int = 3600
+    # A turn whose server-side tools (web search) run long comes back paused;
+    # it is resumed in place at most this many times.
+    anthropic_max_pause_continuations: int = 5
+
     # Streaming + abort signal TTLs (Redis seconds)
     run_stream_key_ttl_seconds: int = 3600
     run_abort_key_ttl_seconds: int = 60

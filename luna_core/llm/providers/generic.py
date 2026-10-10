@@ -27,9 +27,8 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from openai import APITimeoutError, AsyncOpenAI, RateLimitError
@@ -37,7 +36,6 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from luna_core.core.config import settings
-from luna_core.core.db import AsyncSessionLocal
 from luna_core.engine.emitter import EventEmitter, publish_run_event
 from luna_core.llm.base import (
     AbortSignalError,
@@ -48,6 +46,13 @@ from luna_core.llm.base import (
     inflight_meta_key,
     stream_key,
 )
+from luna_core.llm.providers._turn import (
+    _LABELED_KINDS,
+    ImageResolver,
+    StreamingTurnProvider,
+    _MediaLabels,
+    _media_note,
+)
 from luna_core.models.event import AgentMessageRole, RunEventType
 from luna_core.services.usage import record_usage
 
@@ -55,41 +60,6 @@ if TYPE_CHECKING:
     from luna_core.engine.streaming import IOFactory
 
 logger = logging.getLogger(__name__)
-
-# Resolves a media_id to a URL the provider can put on an ``image_url`` content
-# part — in practice a ``data:`` base64 URL (works for both local-dev storage
-# and object storage without exposing a public/signed URL). Host-injected
-# (the host owns its media table + storage); ``None`` means "could not resolve",
-# in which case the image falls back to a text note.
-ImageResolver = Callable[[str], Awaitable[str | None]]
-
-# Attached media the model is told about, by canonical block type: the label
-# prefix, the note's wording, and what "shown" means for it. A video is never
-# played — its poster (first frame) is what a vision model sees, and the note
-# says so, so the model does not claim to have watched it.
-_LABELED_KINDS: dict[str, tuple[str, str, str]] = {
-    "image": ("img", "image attached", "shown below"),
-    "video": ("vid", "video attached", "first frame shown below"),
-}
-
-
-class _MediaLabels:
-    """``img-N`` / ``vid-N`` counters: independent per kind, conversation-wide,
-    in order of appearance — the same order a host derives from its stored
-    messages, so a tool can resolve a label back to the media row."""
-
-    def __init__(self) -> None:
-        self._seq = {kind: 0 for kind in _LABELED_KINDS}
-
-    def next(self, kind: str) -> str:
-        self._seq[kind] += 1
-        return f"{_LABELED_KINDS[kind][0]}-{self._seq[kind]}"
-
-
-def _media_note(kind: str, label: str, shown: bool) -> str:
-    _prefix, what, shown_text = _LABELED_KINDS[kind]
-    return f"[{what}: {label} ({shown_text})]" if shown else f"[{what}: {label}]"
-
 
 def _tools_to_openai(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
     return [
@@ -552,7 +522,18 @@ def _fixed_temperature_model(model: str | None) -> bool:
     return name.startswith(_FIXED_TEMPERATURE_PREFIXES)
 
 
-class GenericProvider:
+def _openai_effort(model: str | None, effort: str | None) -> str | None:
+    """The agent's reasoning effort as OpenAI's reasoning models take it, or
+    None to send nothing. Only those models (gpt-5 family, o-series) accept
+    the parameter — any other model behind this endpoint answers 400 to it.
+    OpenAI's scale tops out at ``high`` on most models, so the two deeper
+    levels ask for ``high``."""
+    if not effort or not _fixed_temperature_model(model):
+        return None
+    return "high" if effort in ("xhigh", "max") else effort
+
+
+class GenericProvider(StreamingTurnProvider):
     """OpenAI-compatible chat + embeddings provider.
 
     Constructed per LLMProvider row by the router (chat side) and once at
@@ -575,11 +556,7 @@ class GenericProvider:
         ]
         | None = None,
     ):
-        # `session_factory` opens a short-lived session for persisting agent
-        # messages mid-stream. Defaults to luna-core's AsyncSessionLocal so
-        # hosts that share that engine don't have to wire anything; hosts with
-        # custom engines pass their own factory.
-        self._session_factory = session_factory or AsyncSessionLocal
+        super().__init__(session_factory=session_factory)
         self._chat_client = AsyncOpenAI(
             api_key=api_key or "missing",
             base_url=base_url,
@@ -611,6 +588,7 @@ class GenericProvider:
         image_resolver: ImageResolver | None = None,
         builtin_tools: list[str] | None = None,
         timezone: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> list[dict[str, Any]]:
         # Chat-completions has nothing tied to local time; only the Responses
         # path (its web search) uses ``timezone``.
@@ -632,6 +610,7 @@ class GenericProvider:
                 image_resolver=image_resolver,
                 builtin_tools=builtin_tools,
                 timezone=timezone,
+                reasoning_effort=reasoning_effort,
             )
         accumulator = _StreamAccumulator()
         a_key = abort_key(run_id)
@@ -708,6 +687,9 @@ class GenericProvider:
 
         if not _fixed_temperature_model(resolved_model):
             request["temperature"] = temperature
+        effort = _openai_effort(resolved_model, reasoning_effort)
+        if effort:
+            request["reasoning_effort"] = effort
 
         flex = _uses_flex(resolved_model)
         if flex:
@@ -902,6 +884,7 @@ class GenericProvider:
         image_resolver: ImageResolver | None,
         builtin_tools: list[str],
         timezone: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> list[dict[str, Any]]:
         """One streaming turn via the OpenAI Responses API. Built-in tools (e.g.
         web_search) run server-side; our function tools come back as ``tool_use``
@@ -933,6 +916,9 @@ class GenericProvider:
             request["instructions"] = system
         if request["tools"]:
             request["tool_choice"] = "auto"
+        effort = _openai_effort(request["model"], reasoning_effort)
+        if effort:
+            request["reasoning"] = {"effort": effort}
 
         try:
             stream = await self._chat_client.responses.create(**request)
@@ -1099,51 +1085,6 @@ class GenericProvider:
         )
         return blocks
 
-    async def _save_partial_blocks(
-        self,
-        text_parts: list[str],
-        thinking_parts: list[str],
-        run_id: uuid.UUID,
-        node_id: str,
-        redis: Redis,
-        message_id: uuid.UUID,
-        build_io: IOFactory,
-    ) -> None:
-        """Persist whatever streamed before an abort/error as a partial turn
-        (mirrors the chat-completions ``_save_partial``)."""
-        s_key = stream_key(run_id, message_id)
-        d_key = f"delta_seq:{run_id}:{message_id}"
-        m_key = inflight_meta_key(run_id, message_id)
-        thinking = "".join(thinking_parts).strip() or None
-        blocks: list[dict[str, Any]] = []
-        if thinking:
-            blocks.append({"type": "thinking", "thinking": thinking})
-        text = "".join(text_parts)
-        if text:
-            blocks.append({"type": "text", "text": text})
-        if not blocks:
-            await redis.delete(s_key, d_key, m_key)
-            return
-        try:
-            async with self._session_factory() as db:
-                emitter = build_io(db)
-                await emitter.save_message(
-                    node_id=node_id,
-                    role=AgentMessageRole.assistant,
-                    content=blocks,
-                    is_partial=True,
-                    thinking=thinking,
-                    message_id=message_id,
-                )
-                await db.commit()
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "failed to persist partial Responses turn for run %s node %s",
-                run_id,
-                node_id,
-            )
-        await redis.delete(s_key, d_key, m_key)
-
     # ------------------------------------------------------------------ embed
     async def embed(self, text: str) -> list[float]:
         # OpenAI's text-embedding-3-* natively down-project via ``dimensions``
@@ -1161,136 +1102,6 @@ class GenericProvider:
         return list(response.data[0].embedding)
 
     # ----------------------------------------------------------------- helpers
-    async def _resolve_image_urls(
-        self,
-        messages: list[dict[str, Any]],
-        image_resolver: ImageResolver | None,
-    ) -> dict[str, str]:
-        """Resolve every distinct attached media ``media_id`` (images AND
-        videos — for a video the host answers with its poster frame) to a
-        renderable URL via the injected resolver. No resolver → empty map
-        (text-note path). Each id is resolved once even if it recurs across
-        turns."""
-        if image_resolver is None:
-            return {}
-        urls: dict[str, str] = {}
-        for msg in messages:
-            for block in msg.get("content", []) or []:
-                if not isinstance(block, dict) or block.get("type") not in _LABELED_KINDS:
-                    continue
-                media_id = block.get("media_id")
-                if media_id is None:
-                    continue
-                key = str(media_id)
-                if key in urls:
-                    continue
-                url = await image_resolver(key)
-                if url:
-                    urls[key] = url
-        return urls
-
-    async def _push_stream(
-        self,
-        redis: Redis,
-        s_key: str,
-        kind: str,
-        text: str,
-    ) -> None:
-        # Append to a Redis LIST cache used both for crash-mid-stream recovery
-        # and for the WebSocket snapshot path: when a client reconnects while
-        # a turn is still streaming, the snapshot reader rehydrates a
-        # synthetic delta from these chunks. The canonical broadcast for live
-        # clients is still the pub/sub event emitted alongside each push.
-        chunk = json.dumps({"kind": kind, "text": text})
-        await redis.rpush(s_key, chunk)
-        await redis.expire(s_key, settings.run_stream_key_ttl_seconds)
-
-    async def _write_inflight_meta(
-        self,
-        redis: Redis,
-        run_id: uuid.UUID,
-        node_id: str,
-        message_id: uuid.UUID,
-        started_seq: int,
-    ) -> None:
-        # Capture the iteration tag of the *task that owns this turn* so
-        # the WebSocket snapshot path can route mid-flight synthesized
-        # delta frames to the right iteration block on the dashboard.
-        # ``get_current_iteration_id`` returns None outside an iteration
-        # scope, and we omit the key in that case so the wire shape for
-        # non-iterative runs stays unchanged.
-        from luna_core.engine.iteration_context import get_current_iteration_id
-
-        # The key is per-message_id (not per-node) so parallel iterations
-        # of the same ai_agent node each write their own meta — see
-        # docstring on ``stream_key``/``inflight_meta_key``. We carry
-        # ``node_id`` in the payload because the snapshot scanner no
-        # longer parses it out of the key.
-        meta: dict[str, Any] = {
-            "message_id": str(message_id),
-            "node_id": node_id,
-            "started_seq": started_seq,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        iteration_id = get_current_iteration_id()
-        if iteration_id is not None:
-            meta["iteration_id"] = str(iteration_id)
-        await redis.set(
-            inflight_meta_key(run_id, message_id),
-            json.dumps(meta),
-            ex=settings.run_stream_key_ttl_seconds,
-        )
-
-    async def _emit(
-        self,
-        build_io: IOFactory,
-        run_id: uuid.UUID,
-        event_type: RunEventType,
-        node_id: str,
-        payload: dict[str, Any],
-    ) -> int | None:
-        """Persist + broadcast an event. Returns the assigned sequence so
-        the caller can base downstream synthetic-sequence math on it
-        (e.g. transient delta events that ride above the same baseline).
-
-        ``run_id`` is retained only for the failure log; persistence goes
-        through the injected ``build_io`` factory."""
-        # Opens a short-lived session per event so the streaming loop never
-        # holds a transaction open while awaiting the next LLM chunk.
-        async with self._session_factory() as db:
-            emitter = build_io(db)
-            try:
-                event = await emitter.emit(
-                    event_type, node_id=node_id, payload=payload
-                )
-                return event.sequence
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    "failed to persist run event %s for run %s node %s",
-                    event_type.value,
-                    run_id,
-                    node_id,
-                )
-                return None
-
-    async def _next_delta_sequence(
-        self, redis: Redis, key: str, base: int
-    ) -> int:
-        """Atomically allocate the next per-stream delta sequence.
-
-        Uses INCR on a Redis key keyed by (run_id, message_id) so the
-        counter survives any in-stream coordination hiccups and stays
-        consistent if the same stream were ever driven by multiple
-        coroutines. The returned sequence is ``base + INCR_value`` so
-        deltas always sort right after the persisted agent_message_started
-        event (whose sequence is ``base``). The key inherits the same TTL
-        as the stream cache and is deleted at end-of-stream.
-        """
-        offset = await redis.incr(key)
-        if offset == 1:
-            await redis.expire(key, settings.run_stream_key_ttl_seconds)
-        return base + int(offset)
-
     async def _save_partial(
         self,
         accumulator: _StreamAccumulator,
