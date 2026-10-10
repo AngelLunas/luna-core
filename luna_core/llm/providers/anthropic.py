@@ -50,6 +50,7 @@ from luna_core.llm.providers._turn import (
     SessionFactory,
     StreamingTurnProvider,
     _anthropic_usage_shim,
+    _context_as_text,
     _data_url_to_image_block,
     _MediaLabels,
     _media_note,
@@ -200,6 +201,7 @@ def _canonical_to_anthropic_messages(
         if isinstance(content, str):
             content = [{"type": "text", "text": content}]
         if role == "user":
+            content = [_context_as_text(b) for b in content]
             parts: list[dict[str, Any]] = []
             for b in content:
                 if b.get("type") != "tool_result":
@@ -560,6 +562,20 @@ class AnthropicProvider(StreamingTurnProvider):
             await db.commit()
         await redis.delete(
             turn.s_key, turn.d_key, inflight_meta_key(run_id, turn.message_id)
+        )
+        # Where the prompt's tokens came from — the only ground truth that the
+        # prompt cache works: a healthy loop reads nearly everything and writes
+        # only what the last turn added.
+        logger.info(
+            "anthropic call — scope=%s node=%s model=%s cache_read=%d cache_write=%d "
+            "uncached=%d output=%d",
+            run_id,
+            node_id,
+            turn.model or model,
+            turn.usage.get("cache_read_input_tokens", 0),
+            turn.usage.get("cache_creation_input_tokens", 0),
+            turn.usage.get("input_tokens", 0),
+            turn.usage.get("output_tokens", 0),
         )
         return turn.blocks
 

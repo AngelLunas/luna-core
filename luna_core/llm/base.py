@@ -11,6 +11,9 @@ content-block list used throughout luna-core. The canonical format is:
   user (tool results): [
     {"type": "tool_result", "tool_use_id": "tc_1", "content": "..."}
   ]
+  user (host context riding the turn — rendered to the model as text,
+  persisted with the turn, never shown as something the user wrote):
+    {"type": "context", "context": "..."}
 """
 from __future__ import annotations
 

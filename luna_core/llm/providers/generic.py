@@ -50,6 +50,7 @@ from luna_core.llm.providers._turn import (
     _LABELED_KINDS,
     ImageResolver,
     StreamingTurnProvider,
+    _context_as_text,
     _MediaLabels,
     _media_note,
 )
@@ -108,6 +109,7 @@ def _canonical_to_openai_messages(
         role = msg.get("role")
         content = msg.get("content", [])
         if role == "user":
+            content = [_context_as_text(b) for b in content]
             tool_results = [b for b in content if b.get("type") == "tool_result"]
             text_blocks = [b for b in content if b.get("type") == "text"]
             media_blocks = [b for b in content if b.get("type") in _LABELED_KINDS]
@@ -285,6 +287,7 @@ def _canonical_to_responses_input(
         role = msg.get("role")
         content = msg.get("content", []) or []
         if role == "user":
+            content = [_context_as_text(b) for b in content]
             for b in content:
                 if b.get("type") == "tool_result":
                     payload = b.get("content")

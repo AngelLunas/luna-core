@@ -73,6 +73,15 @@ def _media_note(kind: str, label: str, shown: bool) -> str:
     return f"[{what}: {label} ({shown_text})]" if shown else f"[{what}: {label}]"
 
 
+def _context_as_text(block: dict[str, Any]) -> dict[str, Any]:
+    """A ``context`` block — host-supplied facts riding a user turn (the
+    current time, …), persisted with it but not part of what the user wrote —
+    as the text block every provider renders. Anything else passes through."""
+    if isinstance(block, dict) and block.get("type") == "context":
+        return {"type": "text", "text": str(block.get("context") or "")}
+    return block
+
+
 def _data_url_to_image_block(url: str) -> dict[str, Any] | None:
     """``data:<media_type>;base64,<data>`` → an Anthropic image content block.
     Non-data URLs are skipped (nothing here can fetch them)."""

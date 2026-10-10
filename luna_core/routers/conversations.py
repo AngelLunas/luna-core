@@ -337,6 +337,10 @@ async def send(
         system_prompt = await _augment_system_prompt(
             request, db, conversation, agent, payload.new_message
         )
+        if payload.new_message or attachments:
+            turn_context = await _turn_context_block(request, db, conversation, agent)
+            if turn_context is not None:
+                attachments = [*(attachments or []), turn_context]
         timing.mark("context")
         extra_call_context = await _call_context(request, db, user.id)
         image_resolver = await _image_resolver(
@@ -631,6 +635,32 @@ async def _augment_system_prompt(
     if not extra:
         return base
     return f"{base}\n\n{extra}" if base else extra
+
+
+async def _turn_context_block(
+    request: Request,
+    db: AsyncSession,
+    conversation: Conversation,
+    agent: Agent,
+) -> dict[str, Any] | None:
+    """Host context that belongs to THIS user turn rather than to the system
+    prompt — facts that change on every turn, like the current time.
+
+    If the host registered ``app.state.chat_turn_context_provider`` — an async
+    ``(db, conversation, agent) -> str | None`` — its text rides the new user
+    turn as a ``context`` block: providers render it to the model as text, it
+    is persisted with the turn (so history stays append-only), and clients do
+    not show it as something the user wrote. Kept out of the system prompt so
+    a per-turn value does not change the prompt prefix every earlier turn is
+    cached behind. Failures never break the turn."""
+    provider = getattr(request.app.state, "chat_turn_context_provider", None)
+    if provider is None:
+        return None
+    try:
+        text = await provider(db, conversation, agent)
+    except Exception:  # noqa: BLE001 — context must never break a turn
+        return None
+    return {"type": "context", "context": text} if text else None
 
 
 async def _follow_handoffs(
