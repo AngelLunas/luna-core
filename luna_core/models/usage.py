@@ -42,6 +42,10 @@ class LLMUsage(Base):
     output_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     # Cached/prompt-cache read tokens, when the provider reports them.
     cached_input_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Prompt-cache WRITE tokens (subset of input_tokens), when the provider
+    # reports them — a write is priced above a plain input token and a read
+    # far below, so cost math needs all three apart.
+    cache_write_input_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Audio input tokens (subset of input_tokens), when the provider reports
     # them — audio and text tokens are priced differently, so cost math needs
     # the split. Populated by audio features (voice STT, audio-input chat).

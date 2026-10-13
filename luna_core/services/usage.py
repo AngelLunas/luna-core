@@ -29,6 +29,12 @@ def _cached_tokens(usage: Any) -> int | None:
     return _int(cached) if cached is not None else None
 
 
+def _cache_write_tokens(usage: Any) -> int | None:
+    details = getattr(usage, "prompt_tokens_details", None)
+    written = getattr(details, "cache_write_tokens", None) if details is not None else None
+    return _int(written) if written is not None else None
+
+
 async def record_usage(
     db: AsyncSession,
     *,
@@ -46,6 +52,7 @@ async def record_usage(
         input_tokens=_int(getattr(usage, "prompt_tokens", 0)),
         output_tokens=_int(getattr(usage, "completion_tokens", 0)),
         cached_input_tokens=_cached_tokens(usage),
+        cache_write_input_tokens=_cache_write_tokens(usage),
         total_tokens=_int(getattr(usage, "total_tokens", 0)),
     )
     db.add(row)

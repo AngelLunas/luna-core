@@ -469,7 +469,13 @@ class AnthropicProvider(StreamingTurnProvider):
             "cache_control": {"type": "ephemeral"},
         }
         if system:
-            request["system"] = system
+            # A breakpoint of its own at the end of the system prompt: the
+            # automatic one sits on the last message, so a NEW conversation that
+            # shares tools + system (another batch of the same job) would find
+            # no entry to read and write the whole prefix again.
+            request["system"] = [
+                {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
+            ]
         if wire_tools:
             request["tools"] = wire_tools
         if spec.adaptive_thinking:

@@ -338,7 +338,11 @@ async def test_request_fields_come_from_the_models_api():
     assert request["thinking"] == {"type": "adaptive", "display": "summarized"}
     assert request["output_config"] == {"effort": "high"}
     assert request["cache_control"] == {"type": "ephemeral"}
-    assert request["system"] == "be brief"
+    # The system prompt carries its own breakpoint, so a new conversation that
+    # shares tools + system reads that prefix instead of writing it again.
+    assert request["system"] == [
+        {"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral"}}
+    ]
     assert request["fallbacks"] == "default"
     assert request["betas"] == ["server-side-fallback-2026-07-01"]
     # The current models take no sampling controls: never sent.

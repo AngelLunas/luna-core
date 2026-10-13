@@ -111,7 +111,7 @@ def _anthropic_usage_shim(usage: dict[str, Any]) -> Any:
         prompt_tokens=prompt_tokens,
         completion_tokens=output_tokens,
         total_tokens=prompt_tokens + output_tokens,
-        prompt_tokens_details=SimpleNamespace(cached_tokens=cache_read),
+        prompt_tokens_details=SimpleNamespace(cached_tokens=cache_read, cache_write_tokens=cache_creation),
     )
 
 
