@@ -148,5 +148,12 @@ class AgentSystemToolGrant(Base):
     requires_approval: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    # When true, the tool is granted but loaded on demand: a provider that
+    # can search its tools keeps the definition out of the context (an index
+    # line names it) until the model asks for it; any other provider gets it
+    # like every other tool.
+    deferred: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
     agent: Mapped[Agent] = relationship(back_populates="agent_system_tool_grants")

@@ -119,6 +119,10 @@ class _ModelSpec:
         return None
 
 
+# The search that loads deferred tools on demand (server-side; same turn).
+_TOOL_SEARCH = {"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"}
+
+
 def _tools_to_anthropic(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for tool in tools:
@@ -126,10 +130,38 @@ def _tools_to_anthropic(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
         schema.setdefault("type", "object")
         if schema["type"] == "object":
             schema.setdefault("properties", {})
-        out.append(
-            {"name": tool.name, "description": tool.description, "input_schema": schema}
-        )
+        item = {"name": tool.name, "description": tool.description, "input_schema": schema}
+        if tool.deferred:
+            item["defer_loading"] = True
+        out.append(item)
+    # Deferred tools need the search that loads them, and at least one tool
+    # in context: the search itself is never deferred.
+    if any(t.deferred for t in tools):
+        out.insert(0, dict(_TOOL_SEARCH))
     return out
+
+
+def _deferred_index(tools: list[ToolDefinition]) -> str:
+    """One line per deferred tool — its name and what it is for — so the
+    model knows each exists and loads it by name instead of guessing a
+    search. The definition itself arrives only when loaded."""
+    lines = []
+    for tool in tools:
+        if not tool.deferred:
+            continue
+        first = (tool.description or "").strip().split("\n")[0]
+        first = first.split(". ")[0].rstrip(".")
+        if len(first) > 140:
+            first = first[:137].rstrip() + "…"
+        lines.append(f"- {tool.name}: {first}")
+    if not lines:
+        return ""
+    return (
+        "## Tools loaded on demand\n"
+        "These tools exist but their definitions are not loaded. To use one, search "
+        "for it by its exact name with `tool_search_tool_regex` (pattern: the name), "
+        "then call it in the same turn.\n" + "\n".join(lines)
+    )
 
 
 def _server_tools(
@@ -468,6 +500,9 @@ class AnthropicProvider(StreamingTurnProvider):
             # every call of a tool loop re-reads it at a fraction of the cost.
             "cache_control": {"type": "ephemeral"},
         }
+        index = _deferred_index(tools)
+        if index:
+            system = f"{system}\n\n{index}" if system else index
         if system:
             # A breakpoint of its own at the end of the system prompt: the
             # automatic one sits on the last message, so a NEW conversation that

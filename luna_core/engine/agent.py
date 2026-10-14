@@ -609,15 +609,26 @@ class AgentRunner:
         if allowed_names is not None:
             mcp_tools = [t for t in mcp_tools if t.name in allowed_names]
 
+        deferred = await self._deferred_tool_names(db, agent_id)
         llm_tools = [
             *(_system_to_llm_tool(t) for t in context_tools),
-            *(_system_to_llm_tool(t) for t in catalog_tools),
+            *(_system_to_llm_tool(t, deferred=t.name in deferred) for t in catalog_tools),
             *(_to_llm_tool(t) for t in mcp_tools),
         ]
         system_by_name: dict[str, SystemTool] = {
             t.name: t for t in (*context_tools, *catalog_tools)
         }
         return llm_tools, system_by_name
+
+    async def _deferred_tool_names(self, db: AsyncSession, agent_id: uuid.UUID) -> set[str]:
+        """System tools granted to load on demand (see AgentSystemToolGrant)."""
+        result = await db.execute(
+            select(AgentSystemToolGrant.tool_name).where(
+                AgentSystemToolGrant.agent_id == agent_id,
+                AgentSystemToolGrant.deferred.is_(True),
+            )
+        )
+        return {row[0] for row in result.all()}
 
     async def _approval_required_names(
         self, db: AsyncSession, agent_id: uuid.UUID
@@ -752,11 +763,12 @@ def _to_llm_tool(tool: MCPToolDefinition) -> LLMToolDefinition:
     )
 
 
-def _system_to_llm_tool(tool: SystemTool) -> LLMToolDefinition:
+def _system_to_llm_tool(tool: SystemTool, *, deferred: bool = False) -> LLMToolDefinition:
     return LLMToolDefinition(
         name=tool.name,
         description=tool.description,
         input_schema=tool.input_schema,
+        deferred=deferred,
     )
 
 

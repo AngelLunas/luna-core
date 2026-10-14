@@ -34,6 +34,9 @@ class ToolDefinition(BaseModel):
     name: str
     description: str = ""
     input_schema: dict[str, Any] = Field(default_factory=dict)
+    # Loaded on demand where the provider can search tools (see
+    # AgentSystemToolGrant.deferred); a plain tool everywhere else.
+    deferred: bool = False
 
 
 class AbortSignalError(RuntimeError):

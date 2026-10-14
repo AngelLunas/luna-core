@@ -101,6 +101,7 @@ class AgentSystemToolGrantRead(BaseModel):
     id: uuid.UUID
     agent_id: uuid.UUID
     tool_name: str
+    deferred: bool = False
 
 
 class InstructionsPreviewIn(BaseModel):
