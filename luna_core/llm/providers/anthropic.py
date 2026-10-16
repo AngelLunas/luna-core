@@ -595,7 +595,7 @@ class AnthropicProvider(StreamingTurnProvider):
             if turn.usage:
                 await record_usage(
                     db,
-                    scope_id=run_id,
+                    scope_id=getattr(emitter, "scope_id", run_id),
                     message_id=turn.message_id,
                     model=turn.model or model,
                     usage=_anthropic_usage_shim(turn.usage),

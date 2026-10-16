@@ -251,7 +251,11 @@ async def classify_route(
             "required": ["agent", "reason"],
             "additionalProperties": False,
         },
-        run_id=scope_id,
+        # A throwaway run id: the streaming providers publish their deltas and
+        # chunk cache straight to Redis under ``run_id``, past any IO — so the
+        # classifier's JSON answer was painted as a bubble of the conversation
+        # it was routing. The IO keeps the real scope for the usage ledger.
+        run_id=uuid.uuid4(),
         node_id=ROUTING_NODE,
         make_io=lambda _db: _SilentIO(scope_id),
     )

@@ -844,7 +844,7 @@ class GenericProvider(StreamingTurnProvider):
             if final_usage is not None:
                 await record_usage(
                     db,
-                    scope_id=run_id,
+                    scope_id=getattr(emitter, "scope_id", run_id),
                     message_id=message_id,
                     model=request["model"],
                     usage=final_usage,
@@ -1077,7 +1077,7 @@ class GenericProvider(StreamingTurnProvider):
             if usage is not None:
                 await record_usage(
                     db,
-                    scope_id=run_id,
+                    scope_id=getattr(emitter, "scope_id", run_id),
                     message_id=message_id,
                     model=request["model"],
                     usage=_ResponsesUsage(usage),
