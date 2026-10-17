@@ -9,7 +9,7 @@ from __future__ import annotations
 import types
 
 from luna_core.engine.agent import build_system_prompt
-from luna_core.engine.nodes import _format_template
+from luna_core.engine.nodes import format_template
 
 
 def _fake_agent(role: str = "", instructions: str = "", output_schema=None):
@@ -36,8 +36,8 @@ def test_resolved_prompt_substitutes_context_and_inputs():
         "inputs": {"profile_id": "uuid-1"},
     }
 
-    resolved_role = _format_template(agent.role, state)
-    resolved_instructions = _format_template(agent.instructions, state)
+    resolved_role = format_template(agent.role, state)
+    resolved_instructions = format_template(agent.instructions, state)
     prompt = build_system_prompt(
         agent, role=resolved_role, instructions=resolved_instructions
     )

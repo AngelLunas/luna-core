@@ -8,6 +8,7 @@ from luna_core.core.dependencies import (
     CurrentUser,
     DBSession,
     RedisClient,
+    authenticate_websocket,
     get_redis_client,
     require_permission,
 )
@@ -243,11 +244,16 @@ async def trigger(
 
 
 @router.websocket("/{flow_id}/stream")
-async def stream(websocket: WebSocket, flow_id: uuid.UUID) -> None:
+async def stream(websocket: WebSocket, flow_id: uuid.UUID, token: str | None = None) -> None:
     """Live FlowRun lifecycle updates for a single flow.
 
     Frames are `{event: "run_created" | "run_status_changed", run: FlowRunRead}`.
     Subscribers upsert into their local runs list keyed by `run.id`.
+    Same users as the REST reads (``flows:read``): an access token as
+    ``?token=`` or bearer.
     """
+    if await authenticate_websocket(websocket, token, permission="flows:read") is None:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
     manager = get_flow_ws_manager()
     await manager.connect(flow_id, websocket)
