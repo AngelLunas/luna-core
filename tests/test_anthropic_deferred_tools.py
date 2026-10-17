@@ -36,3 +36,21 @@ def test_the_index_names_each_deferred_tool_by_its_first_sentence():
     assert "- update_record: Update a record by its name — weights and dates" in index
     assert "read_card" not in index
     assert _deferred_index([ToolDefinition(name="a", description="b")]) == ""
+
+
+def test_a_dropped_connection_is_told_from_an_api_answer():
+    import anthropic
+    import httpx
+
+    from luna_core.llm.providers.anthropic import _is_connection_drop
+
+    req = httpx.Request("POST", "https://example.invalid")
+    assert _is_connection_drop(anthropic.APIConnectionError(request=req))
+
+    class ReadError(Exception):
+        pass
+
+    wrapped = RuntimeError("stream broke")
+    wrapped.__cause__ = ReadError("connection reset")
+    assert _is_connection_drop(wrapped)
+    assert not _is_connection_drop(ValueError("bad request"))

@@ -105,6 +105,9 @@ class Settings(BaseSettings):
     # A turn whose server-side tools (web search) run long comes back paused;
     # it is resumed in place at most this many times.
     anthropic_max_pause_continuations: int = 5
+    # A round whose connection drops before any visible text reached the
+    # user is sent again, this many times, after a short wait.
+    anthropic_stream_retries: int = 2
 
     # Streaming + abort signal TTLs (Redis seconds)
     run_stream_key_ttl_seconds: int = 3600

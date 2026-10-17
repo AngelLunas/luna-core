@@ -22,6 +22,7 @@ altered.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -121,6 +122,23 @@ class _ModelSpec:
 
 # The search that loads deferred tools on demand (server-side; same turn).
 _TOOL_SEARCH = {"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"}
+
+
+def _is_connection_drop(exc: BaseException) -> bool:
+    """A connection that broke or timed out (the SDK's own errors, or the HTTP
+    transport's, which can surface mid-stream unwrapped) — not an API answer."""
+    if isinstance(exc, (anthropic.APIConnectionError, anthropic.APITimeoutError)):
+        return True
+    names = {"ReadError", "RemoteProtocolError", "ReadTimeout", "ConnectError", "ConnectTimeout",
+             "WriteError", "PoolTimeout", "BrokenResourceError"}
+    seen: BaseException | None = exc
+    for _ in range(5):
+        if seen is None:
+            return False
+        if type(seen).__name__ in names:
+            return True
+        seen = seen.__cause__ or seen.__context__
+    return False
 
 
 def _tools_to_anthropic(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
@@ -531,7 +549,7 @@ class AnthropicProvider(StreamingTurnProvider):
 
         turn = _Turn(run_id)
         for _round in range(settings.anthropic_max_pause_continuations + 1):
-            final = await self._stream_round(
+            final = await self._stream_round_retrying(
                 request, turn, run_id=run_id, node_id=node_id, redis=redis, build_io=build_io
             )
             turn.blocks.extend(_to_canonical(final.content))
@@ -626,6 +644,44 @@ class AnthropicProvider(StreamingTurnProvider):
         )
 
     # ------------------------------------------------------------- internals
+    async def _stream_round_retrying(
+        self,
+        request: dict[str, Any],
+        turn: _Turn,
+        *,
+        run_id: uuid.UUID,
+        node_id: str,
+        redis: Redis,
+        build_io: IOFactory,
+    ) -> Any:
+        """``_stream_round``, sent again when the connection drops — but only
+        while no visible text of this round reached the user (retrying after
+        that would show it twice). A dropped connection is a network fact,
+        not an answer: the whole job should not fail on one."""
+        attempt = 0
+        while True:
+            shown = len(turn.text_parts)
+            thinking = len(turn.thinking_parts)
+            try:
+                return await self._stream_round(
+                    request, turn, run_id=run_id, node_id=node_id, redis=redis, build_io=build_io,
+                    retry_left=attempt < settings.anthropic_stream_retries,
+                )
+            except Exception as exc:  # noqa: BLE001 — sorted below
+                if (
+                    attempt >= settings.anthropic_stream_retries
+                    or len(turn.text_parts) != shown
+                    or not _is_connection_drop(exc)
+                ):
+                    raise
+                attempt += 1
+                del turn.thinking_parts[thinking:]
+                logger.warning(
+                    "anthropic round dropped (%s) — retry %d/%d for scope=%s node=%s",
+                    type(exc).__name__, attempt, settings.anthropic_stream_retries, run_id, node_id,
+                )
+                await asyncio.sleep(2 * attempt)
+
     async def _stream_round(
         self,
         request: dict[str, Any],
@@ -635,6 +691,7 @@ class AnthropicProvider(StreamingTurnProvider):
         node_id: str,
         redis: Redis,
         build_io: IOFactory,
+        retry_left: bool = False,
     ) -> Any:
         a_key = abort_key(run_id)
         try:
@@ -656,11 +713,14 @@ class AnthropicProvider(StreamingTurnProvider):
                 turn.message_id, build_io,
             )
             raise LLMRateLimitError(str(exc)) from exc
-        except Exception:
-            await self._save_partial_blocks(
-                turn.text_parts, turn.thinking_parts, run_id, node_id, redis,
-                turn.message_id, build_io,
-            )
+        except Exception as exc:
+            # A drop that will be retried keeps no partial: the retry's answer
+            # is the turn, and a saved fragment would sit beside it.
+            if not (retry_left and not turn.text_parts and _is_connection_drop(exc)):
+                await self._save_partial_blocks(
+                    turn.text_parts, turn.thinking_parts, run_id, node_id, redis,
+                    turn.message_id, build_io,
+                )
             raise
 
     async def _on_event(
