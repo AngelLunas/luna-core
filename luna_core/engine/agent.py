@@ -55,6 +55,17 @@ from luna_core.services.tool_approval import (
 logger = logging.getLogger(__name__)
 
 
+_WORDS_BESIDE_APPROVAL = (
+    "Your calls above await the user's approval and have not run. Write now, in the "
+    "user's language, the message they read beside them: what you found, the options "
+    "you weighed and the one you recommend. Text only — no tool calls."
+)
+
+
+def _has_words(blocks: list[dict[str, Any]]) -> bool:
+    return any(b.get("type") == "text" and (b.get("text") or "").strip() for b in blocks)
+
+
 @dataclass
 class SuspendedForApproval:
     """Returned by ``run``/``resume`` when a chat turn pauses awaiting human
@@ -320,6 +331,21 @@ class AgentRunner:
                 gated = [
                     tu for tu in tool_uses if tu.get("name", "") in approval_names
                 ]
+                # An approval request never reaches the user without words:
+                # when the model went straight to its gated calls, it is asked
+                # once for the message the user reads beside them.
+                if not _has_words(response_blocks):
+                    await self._words_beside_approval(
+                        agent=agent,
+                        messages=messages,
+                        tool_uses=tool_uses,
+                        system=resolved_system,
+                        tools=llm_tools,
+                        scope_id=scope_id,
+                        node_id=node_id,
+                        emitter=emitter,
+                        timezone=call_context.get("timezone"),
+                    )
                 created = await create_pending_approvals(
                     db,
                     conversation_id=scope_id,
@@ -367,6 +393,69 @@ class AgentRunner:
         raise AgentRunnerError(
             f"agent exceeded MAX_TOOL_ITERATIONS={MAX_TOOL_ITERATIONS}"
         )
+
+    async def _words_beside_approval(
+        self,
+        *,
+        agent: Agent,
+        messages: list[dict[str, Any]],
+        tool_uses: list[dict[str, Any]],
+        system: str,
+        tools: list[LLMToolDefinition],
+        scope_id: uuid.UUID,
+        node_id: str,
+        emitter: AgentIO,
+        timezone: str | None,
+    ) -> None:
+        """One text-only completion for a turn that paused for approval with
+        no words: the calls are answered as not run yet, and the model writes
+        what the user reads beside them. Best-effort — the approvals stand
+        either way."""
+        add = getattr(emitter, "add_text_to_last_assistant", None)
+        live = getattr(emitter, "live_only", None)
+        if add is None or live is None:
+            return  # no conversation to write into (a flow, an ephemeral scope)
+        stream = live()
+        ask = [
+            *messages,
+            {
+                "role": "user",
+                "content": [
+                    *(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tu.get("id", ""),
+                            "content": "Not run yet: awaiting the user's approval.",
+                        }
+                        for tu in tool_uses
+                    ),
+                    {"type": "text", "text": _WORDS_BESIDE_APPROVAL},
+                ],
+            },
+        ]
+        try:
+            blocks = await self._llm.complete(
+                provider_id=agent.llm_provider_id,
+                messages=ask,
+                system=system,
+                tools=tools,
+                temperature=agent.temperature,
+                model=agent.model,
+                output_schema=None,
+                run_id=scope_id,
+                node_id=node_id,
+                make_io=stream.for_session,
+                timezone=timezone,
+                reasoning_effort=getattr(agent, "reasoning_effort", None),
+            )
+        except Exception:  # noqa: BLE001 — words are a courtesy, never a failure
+            logger.warning("no words beside the approval for %s", agent.name, exc_info=True)
+            return
+        text = "\n\n".join(
+            b.get("text", "").strip() for b in blocks if b.get("type") == "text" and (b.get("text") or "").strip()
+        )
+        if text:
+            await add(text)
 
     async def _execute_tool_uses(
         self,

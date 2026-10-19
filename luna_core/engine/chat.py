@@ -185,6 +185,40 @@ class ConversationIO:
         assert message is not None  # set on the successful break
         return message
 
+    def live_only(self) -> "_EphemeralIO":
+        """An IO on this conversation's channel that streams but persists
+        nothing — for a completion whose text is written in by hand after."""
+        return _EphemeralIO(self._redis, self._conversation_id)
+
+    async def add_text_to_last_assistant(self, text: str) -> uuid.UUID | None:
+        """Put ``text`` into the conversation's latest assistant message, after
+        its thinking and before its tool calls. Used when a turn pauses for
+        approval with no words of its own (they streamed live already)."""
+        row = (
+            await self._db.execute(
+                select(ConversationMessage)
+                .where(
+                    ConversationMessage.conversation_id == self._conversation_id,
+                    ConversationMessage.role == ConversationMessageRole.assistant,
+                )
+                .order_by(ConversationMessage.sequence.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        blocks = list(row.content or [])
+        at = 0
+        while at < len(blocks) and isinstance(blocks[at], dict) and (
+            blocks[at].get("type") == "thinking"
+            or (blocks[at].get("native") or {}).get("type") in ("thinking", "redacted_thinking")
+        ):
+            at += 1
+        blocks.insert(at, {"type": "text", "text": text})
+        row.content = blocks
+        await self._db.commit()
+        return row.id
+
     # ----------------------------------------------------------------- internals
     async def _next_message_sequence(self) -> int:
         current = await self._db.execute(

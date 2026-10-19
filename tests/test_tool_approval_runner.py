@@ -142,3 +142,68 @@ def test_should_cascade_rejection_cases():
     assert not should_cascade_rejection(rejected, "   ")
     # approving never cascades, reason or not
     assert not should_cascade_rejection(approved, "looks good")
+
+
+# --- words beside an approval ------------------------------------------------
+
+
+class _WordsLLM:
+    def __init__(self, reply: list[dict]) -> None:
+        self.reply = reply
+        self.asked: list = []
+
+    async def complete(self, **kwargs):
+        self.asked.append(kwargs["messages"])
+        return self.reply
+
+
+class _ConversationEmitter(_FakeEmitter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.added: list[str] = []
+
+    async def add_text_to_last_assistant(self, text: str):
+        self.added.append(text)
+
+    def live_only(self):
+        return SimpleNamespace(for_session=lambda db: None)
+
+
+def _agent():
+    return SimpleNamespace(name="a", llm_provider_id=None, temperature=0.2, model="m", reasoning_effort=None)
+
+
+async def _words(llm, emitter):
+    runner = AgentRunner(llm_router=llm, mcp_client=SimpleNamespace())
+    await runner._words_beside_approval(
+        agent=_agent(), messages=[{"role": "assistant", "content": [_tool_use("a")]}],
+        tool_uses=[_tool_use("a")], system="s", tools=[], scope_id=None, node_id="chat",
+        emitter=emitter, timezone=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_silent_pause_gets_the_words_the_user_reads():
+    llm = _WordsLLM([{"type": "text", "text": "Encontré esto; recomiendo aquello."}])
+    emitter = _ConversationEmitter()
+    await _words(llm, emitter)
+    assert emitter.added == ["Encontré esto; recomiendo aquello."]
+    # the pending call is answered as not run, so the request stays well-formed
+    last = llm.asked[0][-1]["content"]
+    assert last[0]["type"] == "tool_result" and last[0]["tool_use_id"] == "a"
+    assert "not run" in last[0]["content"].lower()
+
+
+@pytest.mark.asyncio
+async def test_no_conversation_no_extra_call():
+    llm = _WordsLLM([{"type": "text", "text": "x"}])
+    await _words(llm, _FakeEmitter())  # a scope that cannot hold words
+    assert llm.asked == []
+
+
+@pytest.mark.asyncio
+async def test_a_reply_without_text_adds_nothing():
+    llm = _WordsLLM([{"type": "tool_use", "id": "b", "name": "x", "input": {}}])
+    emitter = _ConversationEmitter()
+    await _words(llm, emitter)
+    assert emitter.added == []
