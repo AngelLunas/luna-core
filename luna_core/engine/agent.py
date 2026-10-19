@@ -58,7 +58,9 @@ logger = logging.getLogger(__name__)
 _WORDS_BESIDE_APPROVAL = (
     "Your calls above await the user's approval and have not run. Write now, in the "
     "user's language, the message they read beside them: what you found, the options "
-    "you weighed and the one you recommend. Text only — no tool calls."
+    "you weighed and the one you recommend. Describe only the calls above, as proposals "
+    "awaiting approval; what you mean to do next, say as what follows once they are "
+    "approved — never as done. Text only — no tool calls."
 )
 
 
