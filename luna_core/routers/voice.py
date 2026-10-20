@@ -26,7 +26,7 @@ from luna_core.schemas.voice import (
     VoiceStart,
     parse_client_frame,
 )
-from luna_core.services.usage import record_usage_counts
+from luna_core.services.usage import record_usage_counts, usage_context
 from luna_core.services.voice_transcription import (
     SttUnavailable,
     open_upstream,
@@ -97,19 +97,21 @@ async def transcribe(websocket: WebSocket, token: str | None = None) -> None:
     # run/conversation, so the scope IS the authenticated user.
     if result.turn_usages:
         try:
-            async with AsyncSessionLocal() as db:
-                for usage in result.turn_usages:
-                    await record_usage_counts(
-                        db,
-                        scope_id=user_id,
-                        message_id=None,
-                        model=config.model,
-                        input_tokens=usage.input_tokens,
-                        output_tokens=usage.output_tokens,
-                        total_tokens=usage.total_tokens,
-                        audio_input_tokens=usage.audio_input_tokens,
-                    )
-                await db.commit()
+            with usage_context(user_id=user_id, purpose="voice"):
+                async with AsyncSessionLocal() as db:
+                    for usage in result.turn_usages:
+                        await record_usage_counts(
+                            db,
+                            scope_id=user_id,
+                            user_id=user_id,
+                            message_id=None,
+                            model=config.model,
+                            input_tokens=usage.input_tokens,
+                            output_tokens=usage.output_tokens,
+                            total_tokens=usage.total_tokens,
+                            audio_input_tokens=usage.audio_input_tokens,
+                        )
+                    await db.commit()
         except Exception:  # noqa: BLE001 — never let bookkeeping kill the socket path
             logger.exception("voice: failed to record usage for user %s", user_id)
 

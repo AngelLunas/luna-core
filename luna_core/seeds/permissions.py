@@ -34,6 +34,8 @@ _ADMIN_WRITES: list[str] = [
     "llm_providers:update",
     "llm_providers:delete",
     "users:manage",
+    "usage:read",
+    "llm_prices:update",
 ]
 
 CORE_PERMISSIONS: list[tuple[str, str, str]] = [

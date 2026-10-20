@@ -95,6 +95,9 @@ async def get_current_user(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="email_not_verified",
         )
+    from luna_core.services.usage import bind_request_user
+
+    bind_request_user(user.id)
     return user
 
 

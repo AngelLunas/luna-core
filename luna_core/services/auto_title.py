@@ -39,6 +39,7 @@ from luna_core.services.conversation import (
     list_messages,
     update_conversation_title,
 )
+from luna_core.services.usage import usage_context
 
 logger = logging.getLogger(__name__)
 
@@ -238,13 +239,16 @@ async def maybe_title_conversation(
             first_user = _first_user_text(messages)
             if not first_user:
                 return
-            raw = await _generate_title(
-                llm_router,
-                provider_id,
-                await _title_model(llm_router, provider_id, model),
-                first_user,
-                scope_id=conversation_id,
-            )
+            # Spawned from the turn, so the turn's user and purpose carry
+            # over: the ledger reads chat.title for the same account.
+            with usage_context(user_id=user_id, purpose="title"):
+                raw = await _generate_title(
+                    llm_router,
+                    provider_id,
+                    await _title_model(llm_router, provider_id, model),
+                    first_user,
+                    scope_id=conversation_id,
+                )
             title = _clean_title(raw, fallback=first_user[:_FALLBACK_CHARS])
             await update_conversation_title(
                 db, conversation_id, title=title, user_id=user_id

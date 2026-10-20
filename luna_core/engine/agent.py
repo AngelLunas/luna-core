@@ -47,6 +47,7 @@ from luna_core.models.agent import Agent, AgentOperation, AgentSystemToolGrant
 from luna_core.models.connector import Operation
 from luna_core.models.event import AgentMessageRole, RunEventType
 from luna_core.models.tool_approval import ToolApproval, ToolApprovalStatus
+from luna_core.services.usage import usage_context
 from luna_core.services.tool_approval import (
     create_pending_approvals,
     decisions_by_tool_use,
@@ -156,6 +157,35 @@ class AgentRunner:
         self._system_tools = system_tool_registry or get_default_registry()
 
     async def run(
+        self,
+        agent: Agent,
+        history: list[dict[str, Any]],
+        new_message: str | None,
+        scope_id: uuid.UUID,
+        node_id: str,
+        emitter: AgentIO,
+        db: AsyncSession,
+        redis: Redis,
+        system_prompt: str | None = None,
+        context_tool_names: list[str] | None = None,
+        extra_call_context: dict[str, Any] | None = None,
+        approval_enabled: bool = False,
+        attachments: list[dict[str, Any]] | None = None,
+        image_resolver: Any | None = None,
+    ) -> dict[str, Any] | str | SuspendedForApproval:
+        # Every model call of this run is ledgered under the agent's name.
+        with usage_context(agent_name=agent.name):
+            return await self._run(
+                agent, history, new_message, scope_id, node_id, emitter, db, redis,
+                system_prompt=system_prompt,
+                context_tool_names=context_tool_names,
+                extra_call_context=extra_call_context,
+                approval_enabled=approval_enabled,
+                attachments=attachments,
+                image_resolver=image_resolver,
+            )
+
+    async def _run(
         self,
         agent: Agent,
         history: list[dict[str, Any]],

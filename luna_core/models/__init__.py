@@ -18,6 +18,7 @@ from luna_core.models.llm_provider import LLMProvider
 from luna_core.models.permission import Permission
 from luna_core.models.refresh_token import RefreshToken
 from luna_core.models.tool_approval import ToolApproval, ToolApprovalStatus
+from luna_core.models.pricing import LLMPrice
 from luna_core.models.usage import LLMUsage
 from luna_core.models.user import User
 
@@ -40,6 +41,7 @@ __all__ = [
     "FlowRunStatus",
     "HTTPMethod",
     "LLMProvider",
+    "LLMPrice",
     "LLMUsage",
     "Operation",
     "Permission",

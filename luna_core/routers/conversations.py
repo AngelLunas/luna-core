@@ -59,6 +59,7 @@ from luna_core.models.event import RunEventType
 from luna_core.services.agent_routing import ROUTING_NODE, handoff_preamble
 from luna_core.services.auto_title import maybe_title_conversation
 from luna_core.services.turn_lock import conversation_turn
+from luna_core.services.usage import usage_context
 from luna_core.services.flow import build_run_stream_snapshot
 from luna_core.services.conversation import (
     ConversationNotFound,
@@ -337,6 +338,33 @@ def _check_turn_size(text: str, attachments: int) -> None:
         )
 
 
+async def _admit_turn(
+    request: Request, db: AsyncSession, user: Any, conversation: Conversation
+) -> None:
+    """Ask the host whether this user may run a turn now (a budget, a rate).
+
+    If the host registered ``app.state.chat_turn_admission`` — an async
+    ``(db, user, conversation) -> dict | None`` — a dict refuses the turn:
+    ``{"status": <HTTP status>, "code": ..., "message": ..., **figures}``,
+    raised like every other refusal (the client words it from the code and
+    hands the user their message back). ``None`` admits. A failing hook
+    admits too: guarding spend must not take the chat down."""
+    hook = getattr(request.app.state, "chat_turn_admission", None)
+    if hook is None:
+        return
+    try:
+        verdict = await hook(db, user, conversation)
+    except Exception:  # noqa: BLE001
+        logger.exception("chat turn admission failed; admitting")
+        return
+    if verdict:
+        verdict = dict(verdict)
+        status_code = int(verdict.pop("status", status.HTTP_429_TOO_MANY_REQUESTS))
+        raise _refusal(
+            status_code, verdict.pop("code"), verdict.pop("message", ""), **verdict
+        )
+
+
 def _turn_in_progress() -> HTTPException:
     return _refusal(
         status.HTTP_409_CONFLICT,
@@ -364,14 +392,16 @@ async def send(
     ``_refusal`` for the body."""
     _check_turn_size(payload.new_message, len(payload.attachment_blocks()))
     conversation = await _get_owned(db, conversation_id, user.id)
+    await _admit_turn(request, db, user, conversation)
     async with conversation_turn(
-        redis, conversation_id, ttl_seconds=settings.chat_turn_lock_seconds
+        redis, conversation_id, ttl_seconds=settings.chat_turn_lock_seconds, owner_id=user.id
     ) as acquired:
         if not acquired:
             raise _turn_in_progress()
-        return await _send_turn(
-            conversation_id, conversation, payload, request, db, redis, user
-        )
+        with usage_context(user_id=user.id, purpose="chat", scope_id=conversation_id):
+            return await _send_turn(
+                conversation_id, conversation, payload, request, db, redis, user
+            )
 
 
 async def _send_turn(
@@ -525,14 +555,16 @@ async def decide_tool_approval(
     the message cap."""
     _check_turn_size(payload.reason or "", 0)
     conversation = await _get_owned(db, conversation_id, user.id)
+    await _admit_turn(request, db, user, conversation)
     async with conversation_turn(
-        redis, conversation_id, ttl_seconds=settings.chat_turn_lock_seconds
+        redis, conversation_id, ttl_seconds=settings.chat_turn_lock_seconds, owner_id=user.id
     ) as acquired:
         if not acquired:
             raise _turn_in_progress()
-        return await _decide_and_resume(
-            conversation_id, conversation, approval_id, payload, request, db, redis, user
-        )
+        with usage_context(user_id=user.id, purpose="chat", scope_id=conversation_id):
+            return await _decide_and_resume(
+                conversation_id, conversation, approval_id, payload, request, db, redis, user
+            )
 
 
 async def _decide_and_resume(

@@ -4,10 +4,17 @@ Every completed assistant turn records one row: the real input/output/cached
 token counts the provider reported, keyed by the **execution scope** (a
 ``flow_run_id`` for flows, a ``conversation_id`` for chat — same neutral
 ``scope_id`` the streaming layer already threads) and the assistant
-``message_id``. No FK on ``scope_id`` (it spans two tables) and no owner column:
-this is raw infrastructure. A host app maps scope → user/credits from its own
-data (e.g. savia joins ``scope_id`` → ``conversations.user_id``). It is the
-single source of truth for what an LLM turn actually cost.
+``message_id``. No FK on ``scope_id`` (it spans two tables).
+
+Each row also says WHO it was for and WHAT it was doing, from the attribution
+the entry point set (``services.usage.usage_context``): ``user_id`` (the
+account the call served; NULL when no user is behind it), ``purpose`` (a dotted
+path of activities, outermost first — ``chat``, ``chat.title``,
+``chat.image`` — whose words the host chooses) and ``agent_name``. That is
+what a per-user budget sums and a usage report groups by, without a host
+mapping every kind of scope back to an owner. It is the single source of truth
+for what an LLM call actually cost; prices live apart (``LLMPrice``) and are
+applied when reading.
 """
 from __future__ import annotations
 
@@ -25,6 +32,7 @@ class LLMUsage(Base):
     __tablename__ = "llm_usage"
     __table_args__ = (
         Index("ix_llm_usage_scope", "scope_id"),
+        Index("ix_llm_usage_user_created", "user_id", "created_at"),
         {"schema": "core"},
     )
 
@@ -38,6 +46,11 @@ class LLMUsage(Base):
         PGUUID(as_uuid=True), nullable=True
     )
     model: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Who and what (see the module docstring). No FK: a deleted user's spend
+    # stays readable for the operator's books.
+    user_id: Mapped[uuid.UUID | None] = mapped_column(PGUUID(as_uuid=True), nullable=True)
+    purpose: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    agent_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     input_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     output_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     # Cached/prompt-cache read tokens, when the provider reports them.

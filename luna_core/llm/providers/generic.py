@@ -55,7 +55,7 @@ from luna_core.llm.providers._turn import (
     _media_note,
 )
 from luna_core.models.event import AgentMessageRole, RunEventType
-from luna_core.services.usage import record_usage, usage_scope
+from luna_core.services.usage import record_embedding_usage, record_usage, usage_scope
 
 if TYPE_CHECKING:
     from luna_core.engine.streaming import IOFactory
@@ -1102,6 +1102,9 @@ class GenericProvider(StreamingTurnProvider):
             input=text,
             **kwargs,
         )
+        tokens = getattr(getattr(response, "usage", None), "prompt_tokens", None)
+        if tokens:
+            await record_embedding_usage(self._embedding_model, int(tokens))
         return list(response.data[0].embedding)
 
     # ----------------------------------------------------------------- helpers

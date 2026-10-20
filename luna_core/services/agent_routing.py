@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from luna_core.mcp.system_tools.registry import SystemTool
+from luna_core.services.usage import usage_context
 
 logger = logging.getLogger(__name__)
 
@@ -230,35 +231,36 @@ async def classify_route(
         + 'Respond with JSON only: {"agent": "<name>", "reason": "<short '
         'reason>"}. The agent MUST be one of the names above.'
     )
-    blocks = await llm_router.complete(
-        provider_id=provider_id,
-        messages=[
-            {"role": "user", "content": [{"type": "text", "text": message}]}
-        ],
-        system=system,
-        tools=[],
-        temperature=0.0,
-        model=model,
-        # Strict structured-output providers (OpenAI/Azure) require EVERY
-        # property to be listed in ``required`` — so ``reason`` is mandatory
-        # too (a short reason is cheap and feeds the routing log anyway).
-        output_schema={
-            "type": "object",
-            "properties": {
-                "agent": {"type": "string", "enum": sorted(valid)},
-                "reason": {"type": "string"},
+    with usage_context(purpose="routing"):
+        blocks = await llm_router.complete(
+            provider_id=provider_id,
+            messages=[
+                {"role": "user", "content": [{"type": "text", "text": message}]}
+            ],
+            system=system,
+            tools=[],
+            temperature=0.0,
+            model=model,
+            # Strict structured-output providers (OpenAI/Azure) require EVERY
+            # property to be listed in ``required`` — so ``reason`` is mandatory
+            # too (a short reason is cheap and feeds the routing log anyway).
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string", "enum": sorted(valid)},
+                    "reason": {"type": "string"},
+                },
+                "required": ["agent", "reason"],
+                "additionalProperties": False,
             },
-            "required": ["agent", "reason"],
-            "additionalProperties": False,
-        },
-        # A throwaway run id: the streaming providers publish their deltas and
-        # chunk cache straight to Redis under ``run_id``, past any IO — so the
-        # classifier's JSON answer was painted as a bubble of the conversation
-        # it was routing. The IO keeps the real scope for the usage ledger.
-        run_id=uuid.uuid4(),
-        node_id=ROUTING_NODE,
-        make_io=lambda _db: _SilentIO(scope_id),
-    )
+            # A throwaway run id: the streaming providers publish their deltas and
+            # chunk cache straight to Redis under ``run_id``, past any IO — so the
+            # classifier's JSON answer was painted as a bubble of the conversation
+            # it was routing. The IO keeps the real scope for the usage ledger.
+            run_id=uuid.uuid4(),
+            node_id=ROUTING_NODE,
+            make_io=lambda _db: _SilentIO(scope_id),
+        )
     text = "".join(
         b.get("text", "") for b in blocks if b.get("type") == "text"
     ).strip()
