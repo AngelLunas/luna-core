@@ -59,6 +59,18 @@ async def record_usage(
     return row
 
 
+def usage_scope(emitter: Any, fallback: uuid.UUID) -> uuid.UUID:
+    """The ledger key for a call made through ``emitter``: its
+    ``usage_scope_id`` when it has one — a sub-agent streams on a scope of its
+    own but its usage belongs to the run or conversation that called it —
+    else its ``scope_id``, else ``fallback`` (the call's run id)."""
+    return (
+        getattr(emitter, "usage_scope_id", None)
+        or getattr(emitter, "scope_id", None)
+        or fallback
+    )
+
+
 async def record_usage_counts(
     db: AsyncSession,
     *,

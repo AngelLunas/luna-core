@@ -142,3 +142,16 @@ async def test_a_structured_answer_gives_the_title_alone():
 async def test_without_a_fast_model_the_title_keeps_the_callers_model():
     assert await auto_title._title_model(_Router(None), uuid.uuid4(), "large") == "large"
     assert await auto_title._title_model(_Router(RuntimeError("down")), uuid.uuid4(), "large") == "large"
+
+
+def test_a_sub_agent_streams_on_its_scope_but_its_usage_counts_for_the_caller():
+    from luna_core.engine.chat import _EphemeralIO
+    from luna_core.services.usage import usage_scope
+
+    own, caller, run = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    io = _EphemeralIO(None, own, usage_scope_id=caller)
+    assert io.scope_id == own
+    assert usage_scope(io, run) == caller
+    # Without a caller scope: the IO's own scope, then the run id.
+    assert usage_scope(_EphemeralIO(None, own), run) == own
+    assert usage_scope(object(), run) == run

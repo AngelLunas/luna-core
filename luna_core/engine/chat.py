@@ -356,13 +356,25 @@ class _EphemeralIO:
     correct and intentional.
     """
 
-    def __init__(self, redis: Redis, scope_id: uuid.UUID) -> None:
+    def __init__(
+        self,
+        redis: Redis,
+        scope_id: uuid.UUID,
+        usage_scope_id: uuid.UUID | None = None,
+    ) -> None:
         self._redis = redis
         self._scope_id = scope_id
+        self._usage_scope_id = usage_scope_id
 
     @property
     def scope_id(self) -> uuid.UUID:
         return self._scope_id
+
+    @property
+    def usage_scope_id(self) -> uuid.UUID | None:
+        """Where the sub-agent's token usage is ledgered (the caller's scope),
+        apart from the channel its events stream on."""
+        return self._usage_scope_id
 
     def for_session(self, _db: AsyncSession) -> "_EphemeralIO":
         return self
@@ -420,6 +432,7 @@ async def run_sub_agent(
     system_tool_registry: SystemToolRegistry | None = None,
     attachments: list[dict[str, Any]] | None = None,
     image_resolver: Any | None = None,
+    usage_scope_id: uuid.UUID | None = None,
 ) -> SubAgentResult:
     """Run ``agent`` as a sub-agent to completion and return its output.
 
@@ -433,9 +446,13 @@ async def run_sub_agent(
     The sub-agent runs on its own fresh scope, so its events and token deltas
     fan out on ``run_event_channel(result.scope_id)`` for a nested live view;
     its transcript is ephemeral and only the final output flows back.
+
+    ``usage_scope_id`` is the scope its token usage counts against — the
+    caller's conversation or run, so what a delegated task cost is not lost
+    under a scope nobody owns. Without it, the sub-agent's own scope.
     """
     scope_id = uuid.uuid4()
-    io = _EphemeralIO(redis, scope_id)
+    io = _EphemeralIO(redis, scope_id, usage_scope_id=usage_scope_id)
     runner = AgentRunner(
         llm_router, mcp_client, system_tool_registry=system_tool_registry
     )

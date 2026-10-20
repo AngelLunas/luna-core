@@ -59,7 +59,7 @@ from luna_core.llm.providers.mcp_catalog import (
     build_mcp_config,
 )
 from luna_core.models.event import AgentMessageRole, RunEventType
-from luna_core.services.usage import record_usage
+from luna_core.services.usage import record_usage, usage_scope
 
 if TYPE_CHECKING:
     from luna_core.engine.streaming import IOFactory
@@ -662,7 +662,7 @@ class ClaudeCLIProvider(StreamingTurnProvider):
             if usage:
                 await record_usage(
                     db,
-                    scope_id=getattr(emitter, "scope_id", run_id),
+                    scope_id=usage_scope(emitter, run_id),
                     message_id=message_id,
                     model=_resolved_model(result, model),
                     usage=_anthropic_usage_shim(usage),
