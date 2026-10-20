@@ -58,6 +58,7 @@ from luna_core.schemas.tool_approval import ToolApprovalDecision, ToolApprovalRe
 from luna_core.models.event import RunEventType
 from luna_core.services.agent_routing import ROUTING_NODE, handoff_preamble
 from luna_core.services.auto_title import maybe_title_conversation
+from luna_core.services.turn_lock import conversation_turn
 from luna_core.services.flow import build_run_stream_snapshot
 from luna_core.services.conversation import (
     ConversationNotFound,
@@ -305,6 +306,45 @@ async def messages(
 
 
 # --- turn (one assistant message) ---
+def _refusal(status_code: int, code: str, message: str, **extra: Any) -> HTTPException:
+    """A turn refused before it ran. ``detail`` is ``{code, message, ...}``: a
+    stable ``code`` the client keys its own wording on (``message`` is the
+    English fallback) plus the figures it needs (``limit``, ``count``). Nothing
+    of the turn was stored, so the client gives the user their words back."""
+    return HTTPException(
+        status_code=status_code, detail={"code": code, "message": message, **extra}
+    )
+
+
+def _check_turn_size(text: str, attachments: int) -> None:
+    limit = settings.chat_max_message_chars
+    if len(text) > limit:
+        raise _refusal(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "message_too_long",
+            f"The message is {len(text)} characters long; the limit is {limit}.",
+            limit=limit,
+            count=len(text),
+        )
+    limit = settings.chat_max_attachments
+    if attachments > limit:
+        raise _refusal(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "too_many_attachments",
+            f"The message carries {attachments} attachments; the limit is {limit}.",
+            limit=limit,
+            count=attachments,
+        )
+
+
+def _turn_in_progress() -> HTTPException:
+    return _refusal(
+        status.HTTP_409_CONFLICT,
+        "turn_in_progress",
+        "Another turn of this conversation is still running.",
+    )
+
+
 @router.post("/{conversation_id}/messages", response_model=SendMessageResponse)
 async def send(
     conversation_id: uuid.UUID,
@@ -316,15 +356,42 @@ async def send(
 ) -> SendMessageResponse:
     """Run one assistant turn over the conversation. Deltas + lifecycle events
     stream on the ``/stream`` WebSocket; this call returns the final output, or
-    ``awaiting_approval`` when the turn paused for human tool approval."""
+    ``awaiting_approval`` when the turn paused for human tool approval.
+
+    Refused before anything runs or is stored — so the client can hand the
+    words back to the user to fix — when the turn is over a cap (422) or
+    another turn of this conversation is still running (409); see
+    ``_refusal`` for the body."""
+    _check_turn_size(payload.new_message, len(payload.attachment_blocks()))
     conversation = await _get_owned(db, conversation_id, user.id)
+    async with conversation_turn(
+        redis, conversation_id, ttl_seconds=settings.chat_turn_lock_seconds
+    ) as acquired:
+        if not acquired:
+            raise _turn_in_progress()
+        return await _send_turn(
+            conversation_id, conversation, payload, request, db, redis, user
+        )
+
+
+async def _send_turn(
+    conversation_id: uuid.UUID,
+    conversation: Conversation,
+    payload: SendMessageRequest,
+    request: Request,
+    db: AsyncSession,
+    redis: Any,
+    user: Any,
+) -> SendMessageResponse:
+    """The turn itself, run under the conversation's turn lock."""
     # Snapshot now (pre-turn), while the row is fresh: whether this conversation
     # still needs an auto-title. Used after the turn to titling off the hot path.
     needs_title = conversation.title is None
     if await count_pending(db, conversation_id) > 0:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="conversation has pending tool approvals; resolve them first",
+        raise _refusal(
+            status.HTTP_409_CONFLICT,
+            "approvals_pending",
+            "The conversation has pending tool approvals; resolve them first.",
         )
     runner = _chat_runner(request)
     resolver = _agent_resolver(request)
@@ -453,8 +520,32 @@ async def decide_tool_approval(
 
     A rejection carrying a reason also rejects the turn's remaining gated calls
     with that same reason (see ``reject_pending_with_reason``), so correcting one
-    call of a multi-call plan resumes the turn instead of stalling on siblings."""
+    call of a multi-call plan resumes the turn instead of stalling on siblings.
+    Refused like a send while another turn runs, or when the reason is over
+    the message cap."""
+    _check_turn_size(payload.reason or "", 0)
     conversation = await _get_owned(db, conversation_id, user.id)
+    async with conversation_turn(
+        redis, conversation_id, ttl_seconds=settings.chat_turn_lock_seconds
+    ) as acquired:
+        if not acquired:
+            raise _turn_in_progress()
+        return await _decide_and_resume(
+            conversation_id, conversation, approval_id, payload, request, db, redis, user
+        )
+
+
+async def _decide_and_resume(
+    conversation_id: uuid.UUID,
+    conversation: Conversation,
+    approval_id: uuid.UUID,
+    payload: ToolApprovalDecision,
+    request: Request,
+    db: AsyncSession,
+    redis: Any,
+    user: Any,
+) -> SendMessageResponse:
+    """Record the decision and resume the turn, under the turn lock."""
     needs_title = conversation.title is None  # pre-resume snapshot (see send())
     approval = await get_approval(db, approval_id)
     if approval.conversation_id != conversation_id:

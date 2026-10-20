@@ -113,6 +113,15 @@ class Settings(BaseSettings):
     run_stream_key_ttl_seconds: int = 3600
     run_abort_key_ttl_seconds: int = 60
 
+    # What one chat turn may carry. A turn over either cap is refused before
+    # anything runs or is stored, with a code the client can explain.
+    chat_max_message_chars: int = 4000
+    chat_max_attachments: int = 6
+    # One turn at a time per conversation: a second send (or an approval
+    # decision) while a turn runs is refused. The lock is released when the
+    # turn ends; this TTL only frees a conversation whose process died mid-turn.
+    chat_turn_lock_seconds: int = 600
+
     # Iteration concurrency ceiling. The user-declared `concurrency` on a
     # scratchpad iteration node is clamped down to this value at dispatch
     # time so a misconfigured node can't blow past what the host hardware

@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 
 class ToolApprovalRead(BaseModel):
@@ -27,7 +27,9 @@ class ToolApprovalRead(BaseModel):
 class ToolApprovalDecision(BaseModel):
     """Approve or reject a pending tool call. ``reason`` is optional on reject
     (a rejection reason, or a "do this instead" instruction). A plain reject of
-    the whole turn does not re-invoke the LLM; a reject with a reason does."""
+    the whole turn does not re-invoke the LLM; a reject with a reason does.
+    The reason's length is capped by the route (``chat_max_message_chars``),
+    which refuses with a code the client can explain."""
 
     decision: Literal["approved", "rejected"]
-    reason: str | None = Field(default=None, max_length=4000)
+    reason: str | None = None
