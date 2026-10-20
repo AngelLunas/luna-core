@@ -68,3 +68,22 @@ async def test_no_hook_no_text_or_a_failing_hook_add_nothing():
     assert await _turn_context_block(no_hook, None, None, None) is None
     assert await _turn_context_block(_request(empty), None, None, None) is None
     assert await _turn_context_block(_request(boom), None, None, None) is None
+
+
+@pytest.mark.asyncio
+async def test_a_hook_that_takes_the_query_gets_the_turn_text():
+    seen = {}
+
+    async def with_query(_db, _conversation, _agent, *, query=None):
+        seen["query"] = query
+        return f"about: {query}"
+
+    async def without_query(_db, _conversation, _agent):
+        return "NOW is 14:30"
+
+    block = await _turn_context_block(_request(with_query), None, None, None, query="¿riego hoy?")
+    assert seen == {"query": "¿riego hoy?"}
+    assert block == {"type": "context", "context": "about: ¿riego hoy?"}
+    # A hook written before the keyword existed keeps working unchanged.
+    old = await _turn_context_block(_request(without_query), None, None, None, query="x")
+    assert old == {"type": "context", "context": "NOW is 14:30"}

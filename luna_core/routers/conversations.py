@@ -157,6 +157,17 @@ def _resolver_takes_routing_kwargs(resolver: AgentResolver) -> bool:
     return "query" in params and "io" in params
 
 
+def _hook_takes_query(hook: Any) -> bool:
+    """Whether a host hook accepts the ``query`` keyword."""
+    try:
+        params = inspect.signature(hook).parameters
+    except (TypeError, ValueError):
+        return False
+    return "query" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
 async def _resolve_agent(
     resolver: AgentResolver,
     db: AsyncSession,
@@ -338,7 +349,9 @@ async def send(
             request, db, conversation, agent, payload.new_message
         )
         if payload.new_message or attachments:
-            turn_context = await _turn_context_block(request, db, conversation, agent)
+            turn_context = await _turn_context_block(
+                request, db, conversation, agent, query=payload.new_message or None
+            )
             if turn_context is not None:
                 attachments = [*(attachments or []), turn_context]
         timing.mark("context")
@@ -642,22 +655,30 @@ async def _turn_context_block(
     db: AsyncSession,
     conversation: Conversation,
     agent: Agent,
+    *,
+    query: str | None = None,
 ) -> dict[str, Any] | None:
     """Host context that belongs to THIS user turn rather than to the system
-    prompt — facts that change on every turn, like the current time.
+    prompt — facts that change on every turn, like the current time, or that
+    depend on what the user just wrote (records it points at, recall keyed by
+    its words).
 
     If the host registered ``app.state.chat_turn_context_provider`` — an async
-    ``(db, conversation, agent) -> str | None`` — its text rides the new user
-    turn as a ``context`` block: providers render it to the model as text, it
-    is persisted with the turn (so history stays append-only), and clients do
-    not show it as something the user wrote. Kept out of the system prompt so
-    a per-turn value does not change the prompt prefix every earlier turn is
-    cached behind. Failures never break the turn."""
+    ``(db, conversation, agent[, *, query]) -> str | None`` — its text rides the
+    new user turn as a ``context`` block: providers render it to the model as
+    text, it is persisted with the turn (so history stays append-only), and
+    clients do not show it as something the user wrote. Kept out of the system
+    prompt so a per-turn value does not change the prompt prefix every earlier
+    turn is cached behind. ``query`` (the turn's text) is passed only to a hook
+    that accepts it. Failures never break the turn."""
     provider = getattr(request.app.state, "chat_turn_context_provider", None)
     if provider is None:
         return None
     try:
-        text = await provider(db, conversation, agent)
+        if _hook_takes_query(provider):
+            text = await provider(db, conversation, agent, query=query)
+        else:
+            text = await provider(db, conversation, agent)
     except Exception:  # noqa: BLE001 — context must never break a turn
         return None
     return {"type": "context", "context": text} if text else None
