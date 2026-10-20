@@ -108,6 +108,9 @@ class Settings(BaseSettings):
     # A round whose connection drops before any visible text reached the
     # user is sent again, this many times, after a short wait.
     anthropic_stream_retries: int = 2
+    # Anthropic's price list, as the markdown its docs publish: the source the
+    # price sync (services.pricing) reads, since no API returns prices.
+    anthropic_pricing_url: str = "https://platform.claude.com/docs/en/about-claude/pricing.md"
 
     # Streaming + abort signal TTLs (Redis seconds)
     run_stream_key_ttl_seconds: int = 3600

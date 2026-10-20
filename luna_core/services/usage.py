@@ -30,7 +30,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Numeric, cast, func, literal, or_, select
+from sqlalchemy import Numeric, and_, case, cast, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from luna_core.models.pricing import LLMPrice
@@ -302,7 +302,19 @@ def _cost_expr(dearest: dict[str, Decimal]):
     audio = func.coalesce(LLMUsage.audio_input_tokens, 0)
     plain = func.greatest(LLMUsage.input_tokens - read - write - audio, 0)
     total = plain * p_in + read * p_read + write * p_write + audio * p_audio + LLMUsage.output_tokens * p_out
-    return cast(total, Numeric(20, 8)) / 1_000_000
+    # Priced by prompt length: past the threshold, the whole call at the
+    # multiple (the prompt is every input token, cache reads and writes too).
+    tier = case(
+        (
+            and_(
+                LLMPrice.long_context_threshold.is_not(None),
+                LLMUsage.input_tokens > LLMPrice.long_context_threshold,
+            ),
+            func.coalesce(LLMPrice.long_context_multiplier, 1),
+        ),
+        else_=1,
+    )
+    return cast(total * tier, Numeric(20, 8)) / 1_000_000
 
 
 async def spend_usd(

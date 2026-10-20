@@ -27,6 +27,7 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 import anthropic
@@ -477,6 +478,24 @@ class AnthropicProvider(StreamingTurnProvider):
         """The fast line's newest model — for side calls that need an answer,
         not depth."""
         return await self.latest_model("haiku")
+
+    async def display_names(self, models: Iterable[str] = ()) -> dict[str, str]:
+        """Model id → the name the provider shows for it ("Claude Opus …"):
+        every model the Models API lists, plus each of ``models`` it does not
+        list (an older or dated id the ledger still holds) looked up on its own.
+        Unknown ids are left out."""
+        names: dict[str, str] = {}
+        async for info in self._client.models.list():
+            names[info.id] = info.display_name
+        for model in models:
+            if model in names:
+                continue
+            try:
+                info = await self._client.models.retrieve(model)
+            except anthropic.NotFoundError:
+                continue
+            names[model] = info.display_name
+        return names
 
     # ------------------------------------------------------------------ chat
     async def complete(
