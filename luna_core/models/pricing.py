@@ -40,6 +40,7 @@ class LLMPrice(Base):
     long_context_multiplier: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True)
     # Where the figures came from: "anthropic-docs" (synced) or "manual".
     source: Mapped[str] = mapped_column(String(32), nullable=False, server_default="manual")
+    # When the figures were last confirmed against their source.
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )

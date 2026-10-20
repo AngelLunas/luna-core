@@ -22,7 +22,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from luna_core.core.config import settings
@@ -154,6 +154,10 @@ async def set_price(
     row.long_context_threshold = price.long_context_threshold
     row.long_context_multiplier = price.long_context_multiplier
     row.source = source
+    # Confirmed against its source now, even when no figure changed: an
+    # unchanged row is never rewritten, and a stale date would read as a
+    # price nobody checked.
+    row.updated_at = func.now()
     return row
 
 
