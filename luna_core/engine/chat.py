@@ -23,8 +23,10 @@ the protocol) and ignored.
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from redis.asyncio import Redis
@@ -39,6 +41,7 @@ from luna_core.engine.emitter import (
     publish_run_event,
 )
 from luna_core.engine.streaming import SupportsSequence
+from luna_core.llm.context import COMPACTION_BLOCK, ContextPolicy, compaction_block, public_compaction
 from luna_core.llm.router import LLMRouter
 from luna_core.mcp.client import MCPClient
 from luna_core.mcp.system_tools import SystemToolRegistry
@@ -48,6 +51,13 @@ from luna_core.models.conversation import (
     ConversationMessageRole,
 )
 from luna_core.models.event import AgentMessageRole, RunEventType
+from luna_core.models.usage import LLMUsage
+
+logger = logging.getLogger(__name__)
+
+# The attachment kinds a provider labels (img-N / vid-N); a compaction counts
+# the ones it summarizes so later labels keep their numbers.
+_MEDIA_KINDS = ("image", "video")
 
 # Event-stream segment label for a chat turn. Chat has no flow nodes; this is
 # a stable tag the streaming events ride under, mirroring how flow events
@@ -262,6 +272,7 @@ class ChatRunner:
         extra_call_context: dict[str, Any] | None = None,
         attachments: list[dict[str, Any]] | None = None,
         image_resolver: Any | None = None,
+        context_policy: ContextPolicy | None = None,
     ) -> dict[str, Any] | str | SuspendedForApproval:
         """Run one assistant turn: stream deltas + lifecycle events on the
         conversation's channel, persist the turn as ``ConversationMessage``
@@ -274,9 +285,24 @@ class ChatRunner:
         user turn — the continuation path a multi-agent host uses to let a second
         agent answer after a handoff. If the turn calls a tool the agent marks
         ``requires_approval``, the turn suspends and returns
-        ``SuspendedForApproval`` — resume via :meth:`resume`."""
-        history = await self._load_history(db, conversation_id)
+        ``SuspendedForApproval`` — resume via :meth:`resume`.
+
+        ``context_policy`` bounds what the model is sent (see
+        ``luna_core.llm.context``). When the last call of the conversation
+        reached its ``compact_at``, a new user turn first compacts the earlier
+        ones — ``compaction_started`` / ``compaction_completed`` on the channel
+        — and runs over the shorter history."""
+        rows = await self._history_rows(db, conversation_id)
         io = ConversationIO(db, redis, conversation_id, agent_name=agent.name)
+        if new_message is not None or attachments:
+            rows = await self._compact_if_due(
+                agent, conversation_id, rows, io, db,
+                system_prompt=system_prompt,
+                timezone=(extra_call_context or {}).get("timezone"),
+                image_resolver=image_resolver,
+                policy=context_policy,
+            )
+        history = [_canonical(row) for row in rows]
         return await self._runner.run(
             agent=agent,
             history=history,
@@ -291,6 +317,7 @@ class ChatRunner:
             approval_enabled=True,
             attachments=attachments,
             image_resolver=image_resolver,
+            context_policy=context_policy,
         )
 
     async def resume(
@@ -303,6 +330,7 @@ class ChatRunner:
         system_prompt: str | None = None,
         extra_call_context: dict[str, Any] | None = None,
         image_resolver: Any | None = None,
+        context_policy: ContextPolicy | None = None,
     ) -> dict[str, Any] | str | SuspendedForApproval:
         """Resume a turn suspended for tool approval. Loads the history (ending
         with the assistant message holding the gated ``tool_use`` blocks) and
@@ -321,24 +349,151 @@ class ChatRunner:
             system_prompt=system_prompt,
             extra_call_context=extra_call_context,
             image_resolver=image_resolver,
+            context_policy=context_policy,
         )
 
     async def _load_history(
         self, db: AsyncSession, conversation_id: uuid.UUID
     ) -> list[dict[str, Any]]:
-        """Prior conversation turns as canonical ``{role, content}`` dicts in
-        sequence order. Partial rows (an interrupted assistant turn) are
-        skipped — they aren't durable context for the next turn."""
+        """The history the model is sent, as canonical ``{role, content}``
+        dicts (see :meth:`_history_rows`)."""
+        return [_canonical(row) for row in await self._history_rows(db, conversation_id)]
+
+    async def _history_rows(
+        self, db: AsyncSession, conversation_id: uuid.UUID
+    ) -> list[ConversationMessage]:
+        """The stored turns the model is sent, in sequence order. Partial rows
+        (an interrupted assistant turn) are skipped — they aren't durable
+        context for the next turn. After a compaction the history starts at
+        its marker, followed by the turns it kept and everything since; the
+        summarized turns stay stored but are no longer sent."""
         result = await db.execute(
             select(ConversationMessage)
             .where(ConversationMessage.conversation_id == conversation_id)
             .order_by(ConversationMessage.sequence)
         )
-        return [
-            {"role": row.role.value, "content": row.content}
-            for row in result.scalars().all()
-            if not row.is_partial
+        rows = [row for row in result.scalars().all() if not row.is_partial]
+        marker = next(
+            (row for row in reversed(rows) if compaction_block(_canonical(row)) is not None), None
+        )
+        if marker is None:
+            return rows
+        through = int(compaction_block(_canonical(marker)).get("compacted_through_sequence") or 0)
+        return [marker, *(
+            row for row in rows
+            if row.sequence > through and row is not marker and compaction_block(_canonical(row)) is None
+        )]
+
+    async def _compact_if_due(
+        self,
+        agent: Agent,
+        conversation_id: uuid.UUID,
+        rows: list[ConversationMessage],
+        io: ConversationIO,
+        db: AsyncSession,
+        *,
+        system_prompt: str | None,
+        timezone: str | None,
+        image_resolver: Any | None,
+        policy: ContextPolicy | None,
+    ) -> list[ConversationMessage]:
+        """Compact before this turn when the conversation's last call reached
+        ``policy.compact_at`` tokens. The summary covers exactly the messages
+        of that call — everything but the last reply, which stays after the
+        marker word for word. Any failure leaves the history as it was: the
+        turn still answers, at full length."""
+        if not policy or not policy.compact_at or len(rows) < 3:
+            return rows
+        if await self._last_call_tokens(db, conversation_id, rows) < policy.compact_at:
+            return rows
+        summarized = rows[:-1] if rows[-1].role is ConversationMessageRole.assistant else rows
+        kept = rows[len(summarized):]
+        await io.emit(RunEventType.compaction_started, node_id=_CHAT_NODE, payload={})
+        native = await self._runner.compact(
+            agent,
+            [_canonical(row) for row in summarized],
+            conversation_id,
+            db,
+            system_prompt=system_prompt,
+            image_resolver=image_resolver,
+            timezone=timezone,
+            instructions=policy.compaction_instructions,
+        )
+        if native is None:
+            await io.emit(RunEventType.compaction_completed, node_id=_CHAT_NODE, payload={"compacted": False})
+            return rows
+        block = {
+            "type": COMPACTION_BLOCK,
+            "native": native,
+            "model": agent.model,
+            "media": _media_counts(summarized),
+            "compacted_through_sequence": summarized[-1].sequence,
+            "at": datetime.now(UTC).isoformat(),
+        }
+        marker = await io.save_message(
+            node_id=_CHAT_NODE, role=AgentMessageRole.system, content=[block]
+        )
+        logger.info(
+            "conversation compacted — conversation=%s agent=%s through=%s",
+            conversation_id, agent.name, block["compacted_through_sequence"],
+        )
+        await io.emit(
+            RunEventType.compaction_completed,
+            node_id=_CHAT_NODE,
+            payload={
+                "compacted": True,
+                "message_id": str(marker.id),
+                "sequence": marker.sequence,
+                **public_compaction(block),
+            },
+        )
+        return [marker, *kept]
+
+    async def _last_call_tokens(
+        self, db: AsyncSession, conversation_id: uuid.UUID, rows: list[ConversationMessage]
+    ) -> int:
+        """Prompt + reply of the latest model call that wrote a message of the
+        history now sent — what the next call starts from. Calls whose words
+        live elsewhere (a title, a sub-agent) don't count."""
+        # A reply kept past a compaction was billed at the old length: only
+        # calls since the marker measure the history as it is now.
+        since = rows[0].sequence if rows and compaction_block(_canonical(rows[0])) else 0
+        ids = [
+            row.id for row in rows
+            if row.role is ConversationMessageRole.assistant and row.sequence > since
         ]
+        if not ids:
+            return 0
+        total = await db.scalar(
+            select(LLMUsage.total_tokens)
+            .where(LLMUsage.scope_id == conversation_id, LLMUsage.message_id.in_(ids))
+            .order_by(LLMUsage.created_at.desc())
+            .limit(1)
+        )
+        return int(total or 0)
+
+
+def _canonical(row: ConversationMessage) -> dict[str, Any]:
+    return {"role": row.role.value, "content": row.content}
+
+
+def _media_counts(rows: list[ConversationMessage]) -> dict[str, int]:
+    """Labeled attachments up to the end of ``rows`` — counting those an
+    earlier compaction already summarized."""
+    counts = {kind: 0 for kind in _MEDIA_KINDS}
+    for row in rows:
+        earlier = compaction_block(_canonical(row))
+        if earlier is not None:
+            for kind, n in (earlier.get("media") or {}).items():
+                if kind in counts:
+                    counts[kind] = int(n)
+            continue
+        if row.role is not ConversationMessageRole.user:
+            continue
+        for block in row.content or []:
+            if isinstance(block, dict) and block.get("type") in counts:
+                counts[block["type"]] += 1
+    return counts
 
 
 # Event-stream segment label for a sub-agent run (see _CHAT_NODE).

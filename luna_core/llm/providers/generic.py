@@ -53,7 +53,9 @@ from luna_core.llm.providers._turn import (
     _context_as_text,
     _MediaLabels,
     _media_note,
+    compaction_text,
 )
+from luna_core.llm.context import ContextPolicy, compaction_block
 from luna_core.models.event import AgentMessageRole, RunEventType
 from luna_core.services.usage import record_embedding_usage, record_usage, usage_scope
 
@@ -104,10 +106,15 @@ def _canonical_to_openai_messages(
     if system:
         result.append({"role": "system", "content": system})
 
-    labels = _MediaLabels()  # img-N / vid-N, conversation-wide, by appearance
+    labels = _MediaLabels(messages)  # img-N / vid-N, conversation-wide, by appearance
     for msg in messages:
         role = msg.get("role")
         content = msg.get("content", [])
+        compaction = compaction_block(msg)
+        if compaction is not None:
+            # Another provider's signed summary: only its text crosses over.
+            result.append({"role": "user", "content": compaction_text(compaction)})
+            continue
         if role == "user":
             content = [_context_as_text(b) for b in content]
             tool_results = [b for b in content if b.get("type") == "tool_result"]
@@ -282,10 +289,14 @@ def _canonical_to_responses_input(
     ``input_image`` part; an unresolved one rides as ``[image attached: img-N]``.
     """
     items: list[dict[str, Any]] = []
-    labels = _MediaLabels()  # img-N / vid-N, conversation-wide, by appearance
+    labels = _MediaLabels(messages)  # img-N / vid-N, conversation-wide, by appearance
     for msg in messages:
         role = msg.get("role")
         content = msg.get("content", []) or []
+        compaction = compaction_block(msg)
+        if compaction is not None:
+            items.append({"role": "user", "content": [{"type": "input_text", "text": compaction_text(compaction)}]})
+            continue
         if role == "user":
             content = [_context_as_text(b) for b in content]
             for b in content:
@@ -592,6 +603,7 @@ class GenericProvider(StreamingTurnProvider):
         builtin_tools: list[str] | None = None,
         timezone: str | None = None,
         reasoning_effort: str | None = None,
+        context_policy: ContextPolicy | None = None,  # no such lever here
     ) -> list[dict[str, Any]]:
         # Chat-completions has nothing tied to local time; only the Responses
         # path (its web search) uses ``timezone``.

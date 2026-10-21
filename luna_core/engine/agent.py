@@ -38,6 +38,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from luna_core.engine.streaming import AgentIO
+from luna_core.llm.context import ContextPolicy
 from luna_core.llm.base import ToolDefinition as LLMToolDefinition
 from luna_core.llm.router import LLMRouter
 from luna_core.mcp.client import MCPClient
@@ -172,6 +173,7 @@ class AgentRunner:
         approval_enabled: bool = False,
         attachments: list[dict[str, Any]] | None = None,
         image_resolver: Any | None = None,
+        context_policy: ContextPolicy | None = None,
     ) -> dict[str, Any] | str | SuspendedForApproval:
         # Every model call of this run is ledgered under the agent's name.
         with usage_context(agent_name=agent.name):
@@ -183,6 +185,7 @@ class AgentRunner:
                 approval_enabled=approval_enabled,
                 attachments=attachments,
                 image_resolver=image_resolver,
+                context_policy=context_policy,
             )
 
     async def _run(
@@ -201,6 +204,7 @@ class AgentRunner:
         approval_enabled: bool = False,
         attachments: list[dict[str, Any]] | None = None,
         image_resolver: Any | None = None,
+        context_policy: ContextPolicy | None = None,
     ) -> dict[str, Any] | str | SuspendedForApproval:
         # ----- prepare tools ------------------------------------------------
         llm_tools, system_by_name = await self._resolve_tools(
@@ -323,6 +327,7 @@ class AgentRunner:
                 # whatever the provider ties to local time follows the user.
                 timezone=call_context.get("timezone"),
                 reasoning_effort=getattr(agent, "reasoning_effort", None),
+                context_policy=context_policy,
             )
 
             if _debug_llm_calls_enabled():
@@ -621,6 +626,7 @@ class AgentRunner:
         context_tool_names: list[str] | None = None,
         extra_call_context: dict[str, Any] | None = None,
         image_resolver: Any | None = None,
+        context_policy: ContextPolicy | None = None,
     ) -> dict[str, Any] | str | SuspendedForApproval:
         """Resume a turn that suspended for approval.
 
@@ -705,7 +711,43 @@ class AgentRunner:
             extra_call_context=extra_call_context,
             approval_enabled=True,
             image_resolver=image_resolver,
+            context_policy=context_policy,
         )
+
+    async def compact(
+        self,
+        agent: Agent,
+        history: list[dict[str, Any]],
+        scope_id: uuid.UUID,
+        db: AsyncSession,
+        system_prompt: str | None = None,
+        context_tool_names: list[str] | None = None,
+        image_resolver: Any | None = None,
+        timezone: str | None = None,
+        instructions: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Ask the agent's provider to summarize ``history`` — on the same
+        model, system prompt and tools a turn would send, so the summary is
+        written with everything the agent knows. The provider's native block,
+        or ``None`` (no such lever, or it failed)."""
+        llm_tools, _ = await self._resolve_tools(db, agent.id, context_tool_names)
+        resolved_system = (
+            system_prompt if system_prompt is not None else build_system_prompt(agent)
+        )
+        with usage_context(agent_name=agent.name):
+            return await self._llm.compact(
+                provider_id=agent.llm_provider_id,
+                messages=history,
+                system=resolved_system,
+                tools=llm_tools,
+                model=agent.model,
+                run_id=scope_id,
+                image_resolver=image_resolver,
+                builtin_tools=list(getattr(agent, "builtin_tools", None) or []) or None,
+                timezone=timezone,
+                reasoning_effort=getattr(agent, "reasoning_effort", None),
+                instructions=instructions,
+            )
 
     # ------------------------------------------------------------------ helpers
     async def _resolve_tools(

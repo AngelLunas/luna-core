@@ -9,6 +9,8 @@ so luna-core stays free of any host's agent/tool/metering choices:
     app.state.chat_agent_resolver: AgentResolver           # required for turns
     app.state.chat_metering_hook:                          # optional
         Callable[[MeteringContext], Awaitable[None]] | None
+    app.state.chat_context_policy:                         # optional
+        Callable[[AsyncSession, Agent], Awaitable[ContextPolicy | None]]
 
 The resolver picks which agent answers a given conversation (a host with one
 orchestrator just returns it; see ``AgentResolver`` for the routing-aware
@@ -42,6 +44,7 @@ from luna_core.core.security import decode_access_token
 from luna_core.engine.agent import SuspendedForApproval
 from luna_core.engine.chat import ChatRunner, ConversationIO
 from luna_core.llm.base import AbortSignalError, abort_key
+from luna_core.llm.context import ContextPolicy
 from luna_core.engine.websocket import WebSocketManager
 from luna_core.models.agent import Agent
 from luna_core.models.conversation import Conversation
@@ -468,6 +471,7 @@ async def _send_turn(
             extra_call_context=extra_call_context,
             attachments=attachments,
             image_resolver=image_resolver,
+            context_policy=await _context_policy(request, db, agent),
         )
         timing.mark("run")
         first_agent = agent
@@ -643,6 +647,7 @@ async def _decide_and_resume(
         image_resolver=await _image_resolver(
             request, db, conversation, agent, user.id
         ),
+        context_policy=await _context_policy(request, db, agent),
     )
     agent, result = await _follow_handoffs(
         db, request, conversation, redis, user.id, agent, result
@@ -860,6 +865,7 @@ async def _follow_handoffs(
             image_resolver=await _image_resolver(
                 request, db, conversation, agent, user_id
             ),
+            context_policy=await _context_policy(request, db, agent),
         )
         hops += 1
     return agent, result
@@ -982,6 +988,25 @@ def _accepts_media_ids(factory: Any) -> bool:
     return "media_ids" in params or any(
         p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
     )
+
+
+async def _context_policy(
+    request: Request, db: AsyncSession, agent: Agent
+) -> ContextPolicy | None:
+    """How much history ``agent``'s calls may carry (see
+    ``luna_core.llm.context``). If the host registered
+    ``app.state.chat_context_policy`` — an async ``(db, agent) ->
+    ContextPolicy | None`` — it decides per agent (its model's price tier, its
+    window); no hook ⇒ the history is sent whole, as before. Failures never
+    break the turn."""
+    hook = getattr(request.app.state, "chat_context_policy", None)
+    if hook is None:
+        return None
+    try:
+        return await hook(db, agent)
+    except Exception:  # noqa: BLE001 — a policy must never break a turn
+        logger.warning("chat_context_policy failed for %s", agent.name, exc_info=True)
+        return None
 
 
 def _chat_runner(request: Request) -> ChatRunner:

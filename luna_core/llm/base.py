@@ -26,6 +26,7 @@ from redis.asyncio import Redis
 
 if TYPE_CHECKING:
     from luna_core.engine.streaming import IOFactory
+    from luna_core.llm.context import ContextPolicy
 
 
 class ToolDefinition(BaseModel):
@@ -91,8 +92,15 @@ class BaseLLMProvider(Protocol):
         builtin_tools: list[str] | None = None,
         timezone: str | None = None,
         reasoning_effort: str | None = None,
+        context_policy: ContextPolicy | None = None,
     ) -> list[dict[str, Any]]:
         """Return canonical assistant content blocks for one tool-calling turn.
+
+        ``context_policy`` asks the provider to trim what it sends when the
+        prompt grows (old tool results cleared server-side); a provider
+        without such a lever ignores it. A history may also start with a
+        ``compaction`` message (see ``luna_core.llm.context``): a provider
+        replays its own signed block, or sends the summary as text.
 
         ``reasoning_effort`` is one of ``REASONING_EFFORTS`` (``None`` = the
         model's default); a provider maps it to its own control or ignores it.

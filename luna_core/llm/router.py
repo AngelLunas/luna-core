@@ -32,6 +32,7 @@ from luna_core.llm.base import (
     LLMRateLimitError,
     ToolDefinition,
 )
+from luna_core.llm.context import ContextPolicy
 from luna_core.llm.kinds import PROVIDER_KINDS
 from luna_core.llm.providers.generic import GenericProvider
 from luna_core.models.llm_provider import LLMProvider
@@ -169,7 +170,11 @@ class LLMRouter:
         builtin_tools: list[str] | None = None,
         timezone: str | None = None,
         reasoning_effort: str | None = None,
+        context_policy: ContextPolicy | None = None,
     ) -> list[dict[str, Any]]:
+        # Passed on only when set: a provider that predates context policies
+        # (or a test double) keeps its signature.
+        extra: dict[str, Any] = {"context_policy": context_policy} if context_policy else {}
         attempt = 0
         last_exc: Exception | None = None
         while attempt <= self._max_retries:
@@ -191,6 +196,7 @@ class LLMRouter:
                     builtin_tools=builtin_tools,
                     timezone=timezone,
                     reasoning_effort=reasoning_effort,
+                    **extra,
                 )
             except AbortSignalError:
                 raise
@@ -229,6 +235,42 @@ class LLMRouter:
                 await asyncio.sleep(delay)
         assert last_exc is not None
         raise last_exc
+
+    async def compact(
+        self,
+        *,
+        provider_id: uuid.UUID,
+        messages: list[dict[str, Any]],
+        system: str,
+        tools: list[ToolDefinition],
+        model: str,
+        run_id: uuid.UUID,
+        image_resolver: Callable[[str], Any] | None = None,
+        builtin_tools: list[str] | None = None,
+        timezone: str | None = None,
+        reasoning_effort: str | None = None,
+        instructions: str | None = None,
+    ) -> dict[str, Any] | None:
+        """One provider-side compaction of ``messages`` — the native summary
+        block — or ``None`` when the provider has none or it failed. Never
+        raises (aborts aside): a conversation that could not compact still
+        answers, at full length."""
+        impl = await self.resolve_chat_provider(provider_id)
+        compact = getattr(impl, "compact", None)
+        if compact is None:
+            return None
+        await self._enforce_rate_limit(provider_id, run_id)
+        try:
+            return await compact(
+                messages=messages, system=system, tools=tools, model=model, run_id=run_id,
+                image_resolver=image_resolver, builtin_tools=builtin_tools,
+                timezone=timezone, reasoning_effort=reasoning_effort, instructions=instructions,
+            )
+        except AbortSignalError:
+            raise
+        except Exception:
+            logger.exception("compaction failed — provider %s scope %s", provider_id, run_id)
+            return None
 
     async def embed(self, text: str) -> list[float]:
         if self._embedding_provider is None:

@@ -56,9 +56,11 @@ from luna_core.llm.providers._turn import (
     _data_url_to_image_block,
     _MediaLabels,
     _media_note,
+    compaction_text,
 )
+from luna_core.llm.context import ContextPolicy, compaction_block
 from luna_core.models.event import AgentMessageRole, RunEventType
-from luna_core.services.usage import record_usage, usage_scope
+from luna_core.services.usage import record_usage, usage_context, usage_scope
 
 if TYPE_CHECKING:
     from luna_core.engine.streaming import IOFactory
@@ -160,6 +162,37 @@ def _tools_to_anthropic(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
     return out
 
 
+_COMPACTION_BETA = "compact-2026-09-04"
+_CONTEXT_EDITING_BETA = "context-management-2025-06-27"
+# The summary caps the whole compaction call, its thinking included; a
+# non-streamed call must also stay under the SDK's long-request guard.
+_COMPACTION_MAX_TOKENS = 16_000
+
+
+def _add_beta(request: dict[str, Any], beta: str) -> None:
+    betas = request.setdefault("betas", [])
+    if beta not in betas:
+        betas.append(beta)
+
+
+def _is_compaction_message(message: dict[str, Any]) -> bool:
+    content = message.get("content")
+    return isinstance(content, list) and any(
+        isinstance(b, dict) and b.get("type") == "compaction" for b in content
+    )
+
+
+def _log_cleared(final: Any, run_id: uuid.UUID) -> None:
+    """What server-side context editing cleared on this call, if anything."""
+    managed = getattr(final, "context_management", None)
+    for edit in getattr(managed, "applied_edits", None) or []:
+        logger.info(
+            "context edited — scope=%s type=%s cleared_tool_uses=%s cleared_input_tokens=%s",
+            run_id, getattr(edit, "type", "?"), getattr(edit, "cleared_tool_uses", "?"),
+            getattr(edit, "cleared_input_tokens", "?"),
+        )
+
+
 def _deferred_index(tools: list[ToolDefinition]) -> str:
     """One line per deferred tool — its name and what it is for — so the
     model knows each exists and loads it by name instead of guessing a
@@ -236,8 +269,14 @@ def _canonical_to_anthropic_messages(
     image_urls: dict[str, str] | None,
     *,
     tools_declared: bool,
+    model: str | None = None,
 ) -> list[dict[str, Any]]:
     """Canonical history → Messages API ``messages``.
+
+    A history that starts at a compaction sends the provider's signed block
+    first, as an assistant message of its own — when the request runs on the
+    model that wrote it; on another model (a handoff) the summary goes as
+    text, which any model reads.
 
     Assistant blocks carrying ``native`` are replayed as written; reasoning
     from another provider (no ``native``) is dropped — it has no signature
@@ -245,12 +284,20 @@ def _canonical_to_anthropic_messages(
     labels as every provider; a resolved one is shown after the text, in
     label order, so the note ``(shown below)`` matches the picture."""
     result: list[dict[str, Any]] = []
-    labels = _MediaLabels()
+    labels = _MediaLabels(messages)
     for msg in messages:
         role = msg.get("role")
         content = msg.get("content", []) or []
         if isinstance(content, str):
             content = [{"type": "text", "text": content}]
+        compaction = compaction_block(msg)
+        if compaction is not None:
+            native = compaction.get("native")
+            if native and model and compaction.get("model") == model:
+                result.append({"role": "assistant", "content": [native]})
+            else:
+                result.append({"role": "user", "content": [{"type": "text", "text": compaction_text(compaction)}]})
+            continue
         if role == "user":
             content = [_context_as_text(b) for b in content]
             parts: list[dict[str, Any]] = []
@@ -514,57 +561,30 @@ class AnthropicProvider(StreamingTurnProvider):
         builtin_tools: list[str] | None = None,
         timezone: str | None = None,
         reasoning_effort: str | None = None,
+        context_policy: ContextPolicy | None = None,
     ) -> list[dict[str, Any]]:
         if not model:
             raise ValueError("anthropic provider requires an explicit model")
         spec = await self._spec(model)
         build_io = make_io or (lambda session: EventEmitter(session, redis, run_id))
-
-        image_urls = (
-            await self._resolve_image_urls(messages, image_resolver) if spec.images else {}
+        request = await self._request(
+            spec, messages=messages, system=system, tools=tools, model=model,
+            image_resolver=image_resolver, builtin_tools=builtin_tools,
+            timezone=timezone, reasoning_effort=reasoning_effort, output_schema=output_schema,
         )
-        wire_tools = [
-            *_server_tools(builtin_tools, spec, timezone),
-            *_tools_to_anthropic(tools),
-        ]
-        request: dict[str, Any] = {
-            "model": model,
-            "max_tokens": spec.max_tokens,
-            "messages": _canonical_to_anthropic_messages(
-                messages, image_urls or None, tools_declared=bool(wire_tools)
-            ),
-            # Caches the longest stable prefix (tools, system, earlier turns):
-            # every call of a tool loop re-reads it at a fraction of the cost.
-            "cache_control": {"type": "ephemeral"},
-        }
-        index = _deferred_index(tools)
-        if index:
-            system = f"{system}\n\n{index}" if system else index
-        if system:
-            # A breakpoint of its own at the end of the system prompt: the
-            # automatic one sits on the last message, so a NEW conversation that
-            # shares tools + system (another batch of the same job) would find
-            # no entry to read and write the whole prefix again.
-            request["system"] = [
-                {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
-            ]
-        if wire_tools:
-            request["tools"] = wire_tools
-        if spec.adaptive_thinking:
-            # "summarized" streams a readable account of the reasoning; without
-            # it the thinking arrives empty and the user sees only a pause.
-            request["thinking"] = {"type": "adaptive", "display": "summarized"}
-        output_config: dict[str, Any] = {}
-        effort = spec.effort_for(reasoning_effort)
-        if effort:
-            output_config["effort"] = effort
-        if output_schema and spec.structured_outputs:
-            output_config["format"] = {"type": "json_schema", "schema": output_schema}
-        if output_config:
-            request["output_config"] = output_config
         if spec.has_fallbacks:
-            request["betas"] = [_FALLBACK_DEFAULT_BETA]
+            _add_beta(request, _FALLBACK_DEFAULT_BETA)
             request["fallbacks"] = "default"
+        if context_policy and context_policy.clear_tool_results_at and request.get("tools"):
+            # The oldest tool results are cleared server-side once the prompt
+            # passes the threshold; the stored history stays whole.
+            _add_beta(request, _CONTEXT_EDITING_BETA)
+            request["context_management"] = {"edits": [{
+                "type": "clear_tool_uses_20250919",
+                "trigger": {"type": "input_tokens", "value": context_policy.clear_tool_results_at},
+                "keep": {"type": "tool_uses", "value": context_policy.keep_tool_results},
+                "clear_at_least": {"type": "input_tokens", "value": context_policy.clear_at_least},
+            }]}
 
         turn = _Turn(run_id)
         for _round in range(settings.anthropic_max_pause_continuations + 1):
@@ -574,6 +594,7 @@ class AnthropicProvider(StreamingTurnProvider):
             turn.blocks.extend(_to_canonical(final.content))
             turn.add_usage(final.usage)
             turn.model = final.model
+            _log_cleared(final, run_id)
             if final.stop_reason != "pause_turn":
                 break
             # The server paused a long server-tool turn: hand its content back
@@ -656,6 +677,120 @@ class AnthropicProvider(StreamingTurnProvider):
             turn.usage.get("output_tokens", 0),
         )
         return turn.blocks
+
+    async def compact(
+        self,
+        messages: list[dict[str, Any]],
+        system: str,
+        tools: list[ToolDefinition],
+        model: str | None,
+        run_id: uuid.UUID,
+        image_resolver: ImageResolver | None = None,
+        builtin_tools: list[str] | None = None,
+        timezone: str | None = None,
+        reasoning_effort: str | None = None,
+        instructions: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Summarize ``messages`` into one signed compaction block (on-demand
+        compaction), on the conversation's own model, ``system`` and tools.
+        ``None`` when the model returned no summary — the caller carries on
+        without one and may ask again later. Its usage is ledgered."""
+        if not model:
+            raise ValueError("anthropic provider requires an explicit model")
+        spec = await self._spec(model)
+        request = await self._request(
+            spec, messages=messages, system=system, tools=tools, model=model,
+            image_resolver=image_resolver, builtin_tools=builtin_tools,
+            timezone=timezone, reasoning_effort=reasoning_effort, output_schema=None,
+        )
+        _add_beta(request, _COMPACTION_BETA)
+        request["max_tokens"] = min(spec.max_tokens, _COMPACTION_MAX_TOKENS)
+        request["compaction"] = {"type": "summarize", **({"instructions": instructions} if instructions else {})}
+        response = await self._client.beta.messages.create(**request)
+        await self._record_compaction_usage(response, run_id, model)
+        if response.stop_reason != "compaction" or not response.content:
+            logger.warning("compaction returned no summary — scope=%s stop=%s", run_id, response.stop_reason)
+            return None
+        return response.content[0].model_dump(exclude_none=True)
+
+    async def _record_compaction_usage(self, response: Any, run_id: uuid.UUID, model: str) -> None:
+        """A compaction reports its call under ``usage.iterations`` (the top
+        level counts no reply); the ledger gets their sum."""
+        totals = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+        for item in getattr(response.usage, "iterations", None) or []:
+            for key in totals:
+                totals[key] += int(getattr(item, key, 0) or 0)
+        if not any(totals.values()):
+            return
+        with usage_context(purpose="compaction"):
+            async with self._session_factory() as db:
+                await record_usage(db, scope_id=run_id, message_id=None, model=response.model or model,
+                                   usage=_anthropic_usage_shim(totals))
+                await db.commit()
+
+    async def _request(
+        self,
+        spec: "_ModelSpec",
+        *,
+        messages: list[dict[str, Any]],
+        system: str,
+        tools: list[ToolDefinition],
+        model: str,
+        image_resolver: ImageResolver | None,
+        builtin_tools: list[str] | None,
+        timezone: str | None,
+        reasoning_effort: str | None,
+        output_schema: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """The Messages API request a call (or a compaction of it) sends: the
+        same model, system, tools, thinking and effort either way."""
+        image_urls = (
+            await self._resolve_image_urls(messages, image_resolver) if spec.images else {}
+        )
+        wire_tools = [
+            *_server_tools(builtin_tools, spec, timezone),
+            *_tools_to_anthropic(tools),
+        ]
+        wire_messages = _canonical_to_anthropic_messages(
+            messages, image_urls or None, tools_declared=bool(wire_tools), model=model
+        )
+        request: dict[str, Any] = {
+            "model": model,
+            "max_tokens": spec.max_tokens,
+            "messages": wire_messages,
+            # Caches the longest stable prefix (tools, system, earlier turns):
+            # every call of a tool loop re-reads it at a fraction of the cost.
+            "cache_control": {"type": "ephemeral"},
+        }
+        index = _deferred_index(tools)
+        if index:
+            system = f"{system}\n\n{index}" if system else index
+        if system:
+            # A breakpoint of its own at the end of the system prompt: the
+            # automatic one sits on the last message, so a NEW conversation that
+            # shares tools + system (another batch of the same job) would find
+            # no entry to read and write the whole prefix again.
+            request["system"] = [
+                {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
+            ]
+        if wire_tools:
+            request["tools"] = wire_tools
+        if spec.adaptive_thinking:
+            # "summarized" streams a readable account of the reasoning; without
+            # it the thinking arrives empty and the user sees only a pause.
+            request["thinking"] = {"type": "adaptive", "display": "summarized"}
+        output_config: dict[str, Any] = {}
+        effort = spec.effort_for(reasoning_effort)
+        if effort:
+            output_config["effort"] = effort
+        if output_schema and spec.structured_outputs:
+            output_config["format"] = {"type": "json_schema", "schema": output_schema}
+        if output_config:
+            request["output_config"] = output_config
+        if any(_is_compaction_message(m) for m in wire_messages):
+            # Every request that carries the signed summary names its beta.
+            _add_beta(request, _COMPACTION_BETA)
+        return request
 
     async def embed(self, text: str) -> list[float]:
         raise NotImplementedError(

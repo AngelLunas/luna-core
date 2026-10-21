@@ -363,6 +363,7 @@ class ClaudeCLIProvider(StreamingTurnProvider):
         builtin_tools: list[str] | None = None,
         timezone: str | None = None,
         reasoning_effort: str | None = None,
+        context_policy: Any = None,  # the CLI owns its context; accepted, unused
     ) -> list[dict[str, Any]]:
         cli_tools: list[str] = []
         for name in builtin_tools or []:

@@ -57,6 +57,12 @@ class RunEventType(str, enum.Enum):
     # decision itself, emitted before the first token of the turn).
     routing_started = "routing_started"
     routing_decided = "routing_decided"
+    # Conversation compaction (pub/sub only): the earlier turns are being
+    # summarized before this turn's call, then the marker message that starts
+    # the model's history from now on. Payload of the second: the public
+    # compaction block plus its message id and sequence — never the summary.
+    compaction_started = "compaction_started"
+    compaction_completed = "compaction_completed"
     tool_called = "tool_called"
     tool_result = "tool_result"
     human_checkpoint = "human_checkpoint"

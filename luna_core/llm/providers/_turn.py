@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from luna_core.core.config import settings
 from luna_core.core.db import AsyncSessionLocal
+from luna_core.llm.context import compaction_block
 from luna_core.llm.base import inflight_meta_key, stream_key
 from luna_core.models.event import AgentMessageRole, RunEventType
 
@@ -60,12 +61,27 @@ class _MediaLabels:
     in order of appearance — the same order a host derives from its stored
     messages, so a tool can resolve a label back to the media row."""
 
-    def __init__(self) -> None:
+    def __init__(self, messages: list[dict[str, Any]] | None = None) -> None:
         self._seq = {kind: 0 for kind in _LABELED_KINDS}
+        # A history that starts at a compaction keeps counting past the
+        # attachments the summary replaced, so a label still names the same
+        # media row the host counts over the whole stored conversation.
+        for msg in (messages or [])[:1]:
+            block = compaction_block(msg)
+            for kind, n in ((block or {}).get("media") or {}).items():
+                if kind in self._seq:
+                    self._seq[kind] = int(n)
 
     def next(self, kind: str) -> str:
         self._seq[kind] += 1
         return f"{_LABELED_KINDS[kind][0]}-{self._seq[kind]}"
+
+
+def compaction_text(block: dict[str, Any]) -> str:
+    """A compaction as plain text, for a provider (or model) that cannot read
+    the signed block: the summary the model would have seen in its place."""
+    summary = ((block.get("native") or {}).get("content") or "").strip()
+    return f"[Earlier conversation, summarized]\n{summary}"
 
 
 def _media_note(kind: str, label: str, shown: bool) -> str:

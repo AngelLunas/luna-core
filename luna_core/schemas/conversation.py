@@ -9,6 +9,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from luna_core.llm.context import COMPACTION_BLOCK, public_compaction
 from luna_core.schemas.tool_approval import ToolApprovalRead
 
 
@@ -48,6 +49,18 @@ class ConversationMessageRead(BaseModel):
     @classmethod
     def _enum_to_value(cls, v: Any) -> Any:
         return v.value if isinstance(v, Enum) else v
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def _hide_summaries(cls, v: Any) -> Any:
+        """A compaction marker reaches the client as where it happened — the
+        summary the model reads never does."""
+        if not isinstance(v, list):
+            return v
+        return [
+            public_compaction(b) if isinstance(b, dict) and b.get("type") == COMPACTION_BLOCK else b
+            for b in v
+        ]
 
 
 class AttachmentRef(BaseModel):
