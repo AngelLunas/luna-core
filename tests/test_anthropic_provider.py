@@ -29,6 +29,7 @@ from anthropic.types.beta import (
 
 from luna_core.llm.base import LLMRateLimitError, LLMRefusalError, ToolDefinition
 from luna_core.llm.providers.anthropic import (
+    OPENING_CUE,
     AnthropicProvider,
     _canonical_to_anthropic_messages,
 )
@@ -348,6 +349,21 @@ async def test_request_fields_come_from_the_models_api():
     # The current models take no sampling controls: never sent.
     assert "temperature" not in request
     assert client.retrieves == [("model-a", ["server-side-fallback-2026-06-01"])]
+
+
+@pytest.mark.asyncio
+async def test_a_turn_over_an_empty_history_carries_the_opening_cue():
+    # The agent speaking first (a host's opening question) has no message to
+    # send; the Messages API needs one, so the call carries a cue — and only
+    # the call: nothing is added to the history it was given.
+    client = _FakeClient([_FakeStream([], _final([_text_block("¡Hola!")]))])
+    history: list[dict[str, Any]] = []
+    await _complete(_provider(client), _FakeRedis(), _CapturingIO(), messages=history)
+
+    assert client.requests[0]["messages"] == [
+        {"role": "user", "content": [{"type": "text", "text": OPENING_CUE}]}
+    ]
+    assert history == []
 
 
 @pytest.mark.asyncio

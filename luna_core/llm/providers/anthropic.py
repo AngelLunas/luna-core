@@ -90,6 +90,11 @@ def _supported(capability: Any) -> bool:
     return bool(getattr(capability, "supported", False))
 
 
+#: What a call over an empty history sends as its one user message (never
+#: stored): the system prompt says what to open with; this only says to.
+OPENING_CUE = "(The conversation opens here. Speak first.)"
+
+
 class _ModelSpec:
     """What one model accepts, as the Models API reports it."""
 
@@ -754,6 +759,11 @@ class AnthropicProvider(StreamingTurnProvider):
         wire_messages = _canonical_to_anthropic_messages(
             messages, image_urls or None, tools_declared=bool(wire_tools), model=model
         )
+        if not wire_messages:
+            # A turn over an empty history — the agent speaking first (a host's
+            # opening question): the Messages API needs one message, so the
+            # call carries a cue the conversation never stores.
+            wire_messages = [{"role": "user", "content": [{"type": "text", "text": OPENING_CUE}]}]
         request: dict[str, Any] = {
             "model": model,
             "max_tokens": spec.max_tokens,
