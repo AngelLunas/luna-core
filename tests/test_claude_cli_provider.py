@@ -801,6 +801,9 @@ def test_reasoning_effort_rides_the_effort_flag(tmp_path):
     argv = provider._build_argv(**common, reasoning_effort="xhigh")
     assert argv[argv.index("--effort") + 1] == "xhigh"
     assert "--effort" not in provider._build_argv(**common)
+    # No flag turns the CLI's thinking off: "none" asks for the lightest level.
+    argv = provider._build_argv(**common, reasoning_effort="none")
+    assert argv[argv.index("--effort") + 1] == "low"
 
 
 def test_the_main_model_is_the_one_that_read_the_prompt_from_the_cache():

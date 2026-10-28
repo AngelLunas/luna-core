@@ -38,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from luna_core.core.config import settings
 from luna_core.engine.emitter import EventEmitter, publish_run_event
 from luna_core.llm.base import (
+    NO_REASONING,
     AbortSignalError,
     LLMRateLimitError,
     ToolDefinition,
@@ -541,9 +542,12 @@ def _openai_effort(model: str | None, effort: str | None) -> str | None:
     None to send nothing. Only those models (gpt-5 family, o-series) accept
     the parameter — any other model behind this endpoint answers 400 to it.
     OpenAI's scale tops out at ``high`` on most models, so the two deeper
-    levels ask for ``high``."""
+    levels ask for ``high``; ``none`` asks for ``low``, the lightest level
+    every one of them takes."""
     if not effort or not _fixed_temperature_model(model):
         return None
+    if effort == NO_REASONING:
+        return "low"
     return "high" if effort in ("xhigh", "max") else effort
 
 

@@ -73,6 +73,9 @@ class LLMRefusalError(RuntimeError):
 # (and ignores it where the model has no such control). ``None`` everywhere
 # means "the model's own default".
 REASONING_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+# Below the scale: no reasoning at all, where the model lets it be switched
+# off; a provider that cannot switch it off sends its lightest level instead.
+NO_REASONING = "none"
 
 
 class BaseLLMProvider(Protocol):

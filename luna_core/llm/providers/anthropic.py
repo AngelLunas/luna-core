@@ -36,6 +36,7 @@ from redis.asyncio import Redis
 from luna_core.core.config import settings
 from luna_core.engine.emitter import EventEmitter, publish_run_event
 from luna_core.llm.base import (
+    NO_REASONING,
     REASONING_EFFORTS,
     AbortSignalError,
     LLMRateLimitError,
@@ -785,7 +786,7 @@ class AnthropicProvider(StreamingTurnProvider):
             ]
         if wire_tools:
             request["tools"] = wire_tools
-        if spec.adaptive_thinking:
+        if spec.adaptive_thinking and reasoning_effort != NO_REASONING:
             # "summarized" streams a readable account of the reasoning; without
             # it the thinking arrives empty and the user sees only a pause.
             request["thinking"] = {"type": "adaptive", "display": "summarized"}

@@ -8,8 +8,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from luna_core.schemas.connector import OperationRead
 
-# Mirrors luna_core.llm.base.REASONING_EFFORTS. None = the model's default.
-ReasoningEffort = Literal["low", "medium", "high", "xhigh", "max"]
+# Mirrors luna_core.llm.base.REASONING_EFFORTS, plus NO_REASONING ("none":
+# no thinking at all). None = the model's default.
+ReasoningEffort = Literal["none", "low", "medium", "high", "xhigh", "max"]
 
 
 class AgentCreate(BaseModel):

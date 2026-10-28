@@ -388,6 +388,15 @@ async def test_effort_steps_down_to_the_deepest_level_the_model_takes():
 
 
 @pytest.mark.asyncio
+async def test_no_reasoning_sends_no_thinking_and_no_effort():
+    client = _FakeClient([_FakeStream([], _final([_text_block("ok")]))])
+    await _complete(_provider(client), _FakeRedis(), _CapturingIO(), reasoning_effort="none")
+    request = client.requests[0]
+    assert "thinking" not in request
+    assert "output_config" not in request
+
+
+@pytest.mark.asyncio
 async def test_model_capabilities_are_cached_between_calls():
     final = _final([_text_block("ok")])
     client = _FakeClient([_FakeStream([], final), _FakeStream([], final)])

@@ -38,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from luna_core.core.config import settings
 from luna_core.llm.base import (
+    NO_REASONING,
     AbortSignalError,
     LLMRateLimitError,
     ToolDefinition,
@@ -491,8 +492,10 @@ class ClaudeCLIProvider(StreamingTurnProvider):
             "--exclude-dynamic-system-prompt-sections",
         ]
         if reasoning_effort:
-            # The CLI takes the same level names as REASONING_EFFORTS.
-            argv += ["--effort", reasoning_effort]
+            # The CLI takes the same level names as REASONING_EFFORTS; it has
+            # no switch to turn thinking off, so NO_REASONING asks for low.
+            level = "low" if reasoning_effort == NO_REASONING else reasoning_effort
+            argv += ["--effort", level]
         if tools:
             tools_file = os.path.join(work_dir, "tools.json")
             with open(tools_file, "w", encoding="utf-8") as f:

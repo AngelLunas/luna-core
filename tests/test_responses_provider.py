@@ -242,3 +242,4 @@ def test_openai_effort_only_for_reasoning_models_and_capped_at_high():
     assert _openai_effort("o3", "max") == "high"
     assert _openai_effort("gpt-4.1", "high") is None
     assert _openai_effort("gpt-5.4", None) is None
+    assert _openai_effort("gpt-5.4", "none") == "low"
