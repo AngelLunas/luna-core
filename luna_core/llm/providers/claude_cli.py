@@ -308,12 +308,15 @@ def _strip_leaked_transcript(text: str) -> str:
 def _resolved_model(result_event: dict[str, Any], requested: str) -> str:
     """Prefer the canonical model the CLI reports (aliases resolve to a real
     model id); the busiest ``modelUsage`` entry is the main model — the CLI
-    also runs small auxiliary calls on a lighter model."""
+    also runs small auxiliary calls on a lighter model. Busiest counts the
+    cached prompt too: the main model reads nearly all of its prompt from the
+    cache, and counted without it a 900-token side call outweighed it."""
     model_usage = result_event.get("modelUsage") or {}
     best, best_tokens = None, -1
     for name, stats in model_usage.items():
-        tokens = int(stats.get("inputTokens") or 0) + int(
-            stats.get("outputTokens") or 0
+        tokens = sum(
+            int(stats.get(key) or 0)
+            for key in ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens")
         )
         if tokens > best_tokens:
             best, best_tokens = name, tokens
