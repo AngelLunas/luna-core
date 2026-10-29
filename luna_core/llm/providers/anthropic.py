@@ -95,6 +95,28 @@ def _supported(capability: Any) -> bool:
 #: stored): the system prompt says what to open with; this only says to.
 OPENING_CUE = "(The conversation opens here. Speak first.)"
 
+#: Added to the last user message when a turn ends with neither a word nor a
+#: call: the grower would see nothing, and the model answers when asked again.
+EMPTY_TURN_CUE = "(Your turn ended without a reply. Answer the last message.)"
+
+
+def _says_anything(blocks: list[dict[str, Any]]) -> bool:
+    """Whether a turn leaves the grower something: text, or a call of any kind."""
+    return any(
+        (b["type"] == "text" and b.get("text", "").strip()) or b["type"] not in ("text", "thinking")
+        for b in blocks
+    )
+
+
+def _with_cue(messages: list[dict[str, Any]], cue: str) -> list[dict[str, Any]]:
+    """``messages`` with ``cue`` closing the last user message (or as a new one)."""
+    block = {"type": "text", "text": cue}
+    if messages and messages[-1]["role"] == "user":
+        last = messages[-1]
+        content = last["content"] if isinstance(last["content"], list) else [{"type": "text", "text": last["content"]}]
+        return [*messages[:-1], {**last, "content": [*content, block]}]
+    return [*messages, {"role": "user", "content": [block]}]
+
 
 class _ModelSpec:
     """What one model accepts, as the Models API reports it."""
@@ -609,6 +631,20 @@ class AnthropicProvider(StreamingTurnProvider):
                 *request["messages"],
                 {"role": "assistant", "content": [_dump(b) for b in final.content]},
             ]
+
+        if final.stop_reason == "end_turn" and not _says_anything(turn.blocks):
+            logger.warning("empty turn — scope=%s model=%s; asking once more", run_id, model)
+            # The empty round's reasoning is dropped: the turn is the answer's.
+            turn.blocks = []
+            request["messages"] = _with_cue(request["messages"], EMPTY_TURN_CUE)
+            final = await self._stream_round_retrying(
+                request, turn, run_id=run_id, node_id=node_id, redis=redis, build_io=build_io
+            )
+            turn.blocks.extend(_to_canonical(final.content))
+            turn.add_usage(final.usage)
+            turn.model = final.model
+            if final.stop_reason == "end_turn" and not _says_anything(turn.blocks):
+                raise RuntimeError(f"{model} ended the turn twice without a reply")
 
         if final.stop_reason == "refusal":
             await self._save_partial_blocks(

@@ -29,6 +29,7 @@ from anthropic.types.beta import (
 
 from luna_core.llm.base import LLMRateLimitError, LLMRefusalError, ToolDefinition
 from luna_core.llm.providers.anthropic import (
+    EMPTY_TURN_CUE,
     OPENING_CUE,
     AnthropicProvider,
     _canonical_to_anthropic_messages,
@@ -364,6 +365,31 @@ async def test_a_turn_over_an_empty_history_carries_the_opening_cue():
         {"role": "user", "content": [{"type": "text", "text": OPENING_CUE}]}
     ]
     assert history == []
+
+
+@pytest.mark.asyncio
+async def test_a_turn_that_ends_without_a_reply_is_asked_once_more():
+    client = _FakeClient([
+        _FakeStream([], _final([])),
+        _FakeStream([], _final([_text_block("En Pereira no hace falta una época.")])),
+    ])
+    io = _CapturingIO()
+    await _complete(_provider(client), _FakeRedis(), io)
+
+    assert len(client.requests) == 2
+    assert client.requests[1]["messages"][-1]["content"][-1] == {"type": "text", "text": EMPTY_TURN_CUE}
+    assert client.requests[1]["messages"][-1]["content"][0]["text"] == "hola"
+    assert [b["text"] for b in io.saved[-1]["content"]] == ["En Pereira no hace falta una época."]
+
+
+@pytest.mark.asyncio
+async def test_a_turn_empty_twice_fails_instead_of_completing():
+    client = _FakeClient([
+        _FakeStream([], _final([_thinking_block()])),
+        _FakeStream([], _final([])),
+    ])
+    with pytest.raises(RuntimeError, match="without a reply"):
+        await _complete(_provider(client), _FakeRedis(), _CapturingIO())
 
 
 @pytest.mark.asyncio
