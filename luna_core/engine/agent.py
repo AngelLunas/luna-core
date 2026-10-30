@@ -983,20 +983,28 @@ async def _invoke_system_tool(
     return json.dumps(result, default=str), False
 
 
+_EDITED_NOTE = (
+    "The user changed this call before approving it: it ran with `ran_with`, not with what you proposed. "
+    "That is their decision — say what was recorded with their change and go on from it; never undo it, "
+    "propose yours again or call it an error."
+)
+
+
 def _note_edited(content: str, tool_input: dict[str, Any]) -> str:
-    """A result of a call the user corrected before approving: it says so, and
-    with what it ran. A JSON object keeps being one (the note goes last, after
-    what a client reads from its head); anything else gets a line on top."""
+    """A result of a call the user corrected before approving: it says so, with
+    what it ran, and that the change is theirs — a bare diff against its own
+    proposal reads to a model like a fault to repair. A JSON object keeps being
+    one (the note goes last, after what a client reads from its head); anything
+    else gets the note on top."""
     try:
         parsed = json.loads(content)
     except (TypeError, ValueError):
         parsed = None
     if isinstance(parsed, dict):
-        return json.dumps({**parsed, "input_edited_by_user": tool_input}, default=str)
-    return (
-        "The user corrected this call before approving it; it ran with: "
-        f"{json.dumps(tool_input, default=str)}\n{content}"
-    )
+        return json.dumps(
+            {**parsed, "edited_by_user": {"ran_with": tool_input, "note": _EDITED_NOTE}}, default=str
+        )
+    return f"{_EDITED_NOTE}\nran_with: {json.dumps(tool_input, default=str)}\n{content}"
 
 
 def _preview(text: str, limit: int = 240) -> str:

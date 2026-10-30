@@ -232,7 +232,8 @@ async def test_approved_with_corrected_inputs_runs_them_and_says_so():
     assert called == [{"x": 2}]  # what the user corrected ran, not the proposal
     content = json.loads(blocks[0]["content"])
     assert list(content)[:2] == ["summary", "saved"]  # the head a client reads stays first
-    assert content["input_edited_by_user"] == {"x": 2}
+    assert content["edited_by_user"]["ran_with"] == {"x": 2}
+    assert "their decision" in content["edited_by_user"]["note"]
 
 
 @pytest.mark.asyncio
@@ -250,7 +251,7 @@ async def test_approved_with_the_same_inputs_is_a_plain_approval():
         emitter=_FakeEmitter(),
         node_id="chat",
     )
-    assert "input_edited_by_user" not in json.loads(blocks[0]["content"])
+    assert "edited_by_user" not in json.loads(blocks[0]["content"])
 
 
 def test_corrected_inputs_go_with_an_approval_only():
