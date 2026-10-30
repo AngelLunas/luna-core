@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 
 class ToolApprovalRead(BaseModel):
@@ -33,3 +33,12 @@ class ToolApprovalDecision(BaseModel):
 
     decision: Literal["approved", "rejected"]
     reason: str | None = None
+    #: Approve the call with these inputs instead of the proposed ones — the
+    #: user corrected it in the app's own form before saying yes. Approve only.
+    tool_input: dict | None = None
+
+    @model_validator(mode="after")
+    def _edited_only_when_approved(self) -> ToolApprovalDecision:
+        if self.tool_input is not None and self.decision != "approved":
+            raise ValueError("tool_input goes with an approval only")
+        return self

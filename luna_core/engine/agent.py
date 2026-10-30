@@ -546,6 +546,17 @@ class AgentRunner:
                 )
                 continue
 
+            # Approved with corrected inputs (the user fixed the call in the
+            # app's own form): it runs as approved, and says so in its result.
+            edited = (
+                decision is not None
+                and decision.status == ToolApprovalStatus.approved.value
+                and bool(decision.tool_input)
+                and decision.tool_input != tool_input
+            )
+            if edited:
+                tool_input = dict(decision.tool_input)
+
             await emitter.emit(
                 RunEventType.tool_called,
                 node_id=node_id,
@@ -561,6 +572,8 @@ class AgentRunner:
                 payload_content, is_error = await _invoke_system_tool(
                     system_tool, tool_input, call_context
                 )
+                if edited:
+                    payload_content = _note_edited(payload_content, tool_input)
                 tool_result_blocks.append(
                     {
                         "type": "tool_result",
@@ -590,6 +603,8 @@ class AgentRunner:
             )
             if not isinstance(payload_content, str):
                 payload_content = json.dumps(payload_content, default=str)
+            if edited:
+                payload_content = _note_edited(payload_content, tool_input)
 
             tool_result_blocks.append(
                 {
@@ -966,6 +981,22 @@ async def _invoke_system_tool(
     if isinstance(result, str):
         return result, False
     return json.dumps(result, default=str), False
+
+
+def _note_edited(content: str, tool_input: dict[str, Any]) -> str:
+    """A result of a call the user corrected before approving: it says so, and
+    with what it ran. A JSON object keeps being one (the note goes last, after
+    what a client reads from its head); anything else gets a line on top."""
+    try:
+        parsed = json.loads(content)
+    except (TypeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict):
+        return json.dumps({**parsed, "input_edited_by_user": tool_input}, default=str)
+    return (
+        "The user corrected this call before approving it; it ran with: "
+        f"{json.dumps(tool_input, default=str)}\n{content}"
+    )
 
 
 def _preview(text: str, limit: int = 240) -> str:

@@ -100,9 +100,12 @@ async def decide(
     decision: str,
     reason: str | None = None,
     resolved_by: uuid.UUID | None = None,
+    tool_input: dict | None = None,
 ) -> ToolApproval:
     """Atomically resolve a pending approval. Raises ``ToolApprovalNotPending``
-    if it was already resolved (so only the winning request resumes the turn)."""
+    if it was already resolved (so only the winning request resumes the turn).
+    ``tool_input`` replaces the proposed inputs: the call runs with what the
+    user corrected, and the row keeps what ran."""
     stmt = (
         update(ToolApproval)
         .where(
@@ -114,6 +117,7 @@ async def decide(
             reason=reason,
             resolved_at=datetime.now(timezone.utc),
             resolved_by=resolved_by,
+            **({"tool_input": tool_input} if tool_input is not None else {}),
         )
         .returning(ToolApproval.id)
     )

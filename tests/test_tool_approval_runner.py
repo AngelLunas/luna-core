@@ -12,6 +12,7 @@ other engine tests:
 """
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -207,3 +208,56 @@ async def test_a_reply_without_text_adds_nothing():
     emitter = _ConversationEmitter()
     await _words(llm, emitter)
     assert emitter.added == []
+
+
+@pytest.mark.asyncio
+async def test_approved_with_corrected_inputs_runs_them_and_says_so():
+    called: list = []
+
+    async def handler(args, *, call_context):
+        called.append(args)
+        return {"summary": "Cosecha", "saved": True}
+
+    approval = _approval("a", ToolApprovalStatus.approved)
+    approval.tool_input = {"x": 2}
+    blocks, _terminal, _tv = await _runner()._execute_tool_uses(
+        [_tool_use("a", inp={"x": 1})],
+        decisions={"a": approval},
+        system_by_name={"log_care_event": _tool(handler)},
+        call_context={},
+        emitter=_FakeEmitter(),
+        node_id="chat",
+    )
+
+    assert called == [{"x": 2}]  # what the user corrected ran, not the proposal
+    content = json.loads(blocks[0]["content"])
+    assert list(content)[:2] == ["summary", "saved"]  # the head a client reads stays first
+    assert content["input_edited_by_user"] == {"x": 2}
+
+
+@pytest.mark.asyncio
+async def test_approved_with_the_same_inputs_is_a_plain_approval():
+    async def handler(args, *, call_context):
+        return {"saved": True}
+
+    approval = _approval("a", ToolApprovalStatus.approved)
+    approval.tool_input = {"x": 1}
+    blocks, _terminal, _tv = await _runner()._execute_tool_uses(
+        [_tool_use("a", inp={"x": 1})],
+        decisions={"a": approval},
+        system_by_name={"log_care_event": _tool(handler)},
+        call_context={},
+        emitter=_FakeEmitter(),
+        node_id="chat",
+    )
+    assert "input_edited_by_user" not in json.loads(blocks[0]["content"])
+
+
+def test_corrected_inputs_go_with_an_approval_only():
+    from pydantic import ValidationError
+
+    from luna_core.schemas.tool_approval import ToolApprovalDecision
+
+    assert ToolApprovalDecision(decision="approved", tool_input={"x": 2}).tool_input == {"x": 2}
+    with pytest.raises(ValidationError):
+        ToolApprovalDecision(decision="rejected", tool_input={"x": 2})

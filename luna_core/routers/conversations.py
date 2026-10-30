@@ -593,6 +593,7 @@ async def _decide_and_resume(
             decision=payload.decision,
             reason=payload.reason,
             resolved_by=user.id,
+            tool_input=payload.tool_input,
         )
     except ToolApprovalNotFound as exc:
         raise _approval_not_found(approval_id) from exc
