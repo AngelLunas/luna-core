@@ -240,8 +240,9 @@ async def index(
     user: CurrentUser,
     limit: int | None = Query(None, ge=1, le=100),
     offset: int = Query(0, ge=0),
+    q: str | None = Query(None, max_length=120),
 ) -> list[ConversationRead]:
-    rows = await list_conversations(db, user_id=user.id, limit=limit, offset=offset)
+    rows = await list_conversations(db, user_id=user.id, limit=limit, offset=offset, q=q)
     return [ConversationRead.model_validate(c) for c in rows]
 
 

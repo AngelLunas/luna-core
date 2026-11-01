@@ -32,20 +32,31 @@ async def create_conversation(
     return conversation
 
 
+def title_pattern(q: str) -> str:
+    """The LIKE pattern for a title search: the words typed, anywhere in the
+    title, with LIKE's own wildcards escaped so «50%» finds «50%»."""
+    escaped = q.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
 async def list_conversations(
     db: AsyncSession,
     *,
     user_id: uuid.UUID,
     limit: int | None = None,
     offset: int = 0,
+    q: str | None = None,
 ) -> list[Conversation]:
     """The user's conversations, most recently touched first. With limit
-    the caller reads one page; a page shorter than limit is the last one."""
+    the caller reads one page; a page shorter than limit is the last one.
+    With ``q`` only the titles containing it (case-insensitive)."""
     stmt = (
         select(Conversation)
         .where(Conversation.user_id == user_id)
         .order_by(Conversation.updated_at.desc())
     )
+    if q and q.strip():
+        stmt = stmt.where(Conversation.title.ilike(title_pattern(q), escape="\\"))
     if limit is not None:
         stmt = stmt.limit(limit).offset(offset)
     result = await db.execute(stmt)
