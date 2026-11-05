@@ -13,6 +13,7 @@ from luna_core.routers.conversations import (
     _augment_system_prompt,
     _call_context,
     _follow_handoffs,
+    _resuming_agent,
 )
 
 
@@ -268,3 +269,35 @@ async def test_a_handoff_continuation_carries_the_timezone():
     request.app.state.user_timezone_provider = hook
     await _follow_handoffs(None, request, SimpleNamespace(id=uuid.uuid4()), None, uuid.uuid4(), orch, "x")
     assert [c.get("timezone") for c in seen] == ["America/Bogota"]
+
+
+class _Db:
+    def __init__(self, agents: dict[str, _Agent]) -> None:
+        self.agents = agents
+
+    async def scalar(self, stmt):
+        name = stmt.whereclause.right.value
+        return self.agents.get(name)
+
+
+@pytest.mark.asyncio
+async def test_an_approved_call_resumes_with_the_agent_that_asked_for_it():
+    mentor, onboarding = _Agent("mentor"), _Agent("onboarding")
+
+    async def resolver(db, conversation):
+        return onboarding  # the host routed the conversation elsewhere meanwhile
+
+    db = _Db({"mentor": mentor, "onboarding": onboarding})
+    assert await _resuming_agent(resolver, db, SimpleNamespace(), "mentor") is mentor
+
+
+@pytest.mark.asyncio
+async def test_the_resolver_picks_when_the_asking_agent_is_gone_or_unknown():
+    onboarding = _Agent("onboarding")
+
+    async def resolver(db, conversation):
+        return onboarding
+
+    db = _Db({"onboarding": onboarding})
+    assert await _resuming_agent(resolver, db, SimpleNamespace(), "retired") is onboarding
+    assert await _resuming_agent(resolver, db, SimpleNamespace(), None) is onboarding

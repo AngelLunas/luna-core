@@ -30,6 +30,7 @@ from typing import Any
 
 import jwt
 from fastapi import APIRouter, HTTPException, Request, Response, WebSocket, status, Query
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from luna_core.core.db import AsyncSessionLocal
@@ -185,6 +186,27 @@ async def _resolve_agent(
     if _resolver_takes_routing_kwargs(resolver):
         return await resolver(db, conversation, query=query, io=io)
     return await resolver(db, conversation)
+
+
+async def _resuming_agent(
+    resolver: AgentResolver,
+    db: AsyncSession,
+    conversation: Conversation,
+    suspended_by: str | None,
+    *,
+    io: ConversationIO | None = None,
+) -> Agent:
+    """The agent a turn suspended for approval resumes with: the one that
+    suspended it, since the calls are its own and only its tools run them.
+    The host may have routed the conversation elsewhere while the approval
+    waited (an onboarding reopened, say). Its resolver picks only when that
+    agent is gone — with no new user text, so a routing-aware resolver
+    returns the sticky agent."""
+    if suspended_by:
+        agent = await db.scalar(select(Agent).where(Agent.name == suspended_by))
+        if agent is not None:
+            return agent
+    return await _resolve_agent(resolver, db, conversation, io=io)
 
 
 class _TurnTiming:
@@ -626,12 +648,11 @@ async def _decide_and_resume(
             pending=[ToolApprovalRead.model_validate(p) for p in pending],
         )
 
-    # All resolved → resume the turn (no new user text, so a routing-aware
-    # resolver just returns the sticky agent).
-    resolver = _agent_resolver(request)
+    # All resolved → resume the turn.
     runner = _chat_runner(request)
-    agent = await _resolve_agent(
-        resolver, db, conversation, io=ConversationIO(db, redis, conversation_id)
+    agent = await _resuming_agent(
+        _agent_resolver(request), db, conversation, approval.agent_name,
+        io=ConversationIO(db, redis, conversation_id),
     )
     # The resumed call gets the same host context a fresh turn gets (date,
     # place, memory, the card a linked conversation is about): the model's
