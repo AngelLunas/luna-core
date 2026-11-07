@@ -203,6 +203,20 @@ def _add_beta(request: dict[str, Any], beta: str) -> None:
         betas.append(beta)
 
 
+def _clear_tool_results(request: dict[str, Any], policy: ContextPolicy | None) -> None:
+    """The oldest tool results are cleared server-side once the prompt passes
+    the policy's threshold; the stored history stays whole."""
+    if not (policy and policy.clear_tool_results_at and request.get("tools")):
+        return
+    _add_beta(request, _CONTEXT_EDITING_BETA)
+    request["context_management"] = {"edits": [{
+        "type": "clear_tool_uses_20250919",
+        "trigger": {"type": "input_tokens", "value": policy.clear_tool_results_at},
+        "keep": {"type": "tool_uses", "value": policy.keep_tool_results},
+        "clear_at_least": {"type": "input_tokens", "value": policy.clear_at_least},
+    }]}
+
+
 def _is_compaction_message(message: dict[str, Any]) -> bool:
     content = message.get("content")
     return isinstance(content, list) and any(
@@ -603,16 +617,7 @@ class AnthropicProvider(StreamingTurnProvider):
         if spec.has_fallbacks:
             _add_beta(request, _FALLBACK_DEFAULT_BETA)
             request["fallbacks"] = "default"
-        if context_policy and context_policy.clear_tool_results_at and request.get("tools"):
-            # The oldest tool results are cleared server-side once the prompt
-            # passes the threshold; the stored history stays whole.
-            _add_beta(request, _CONTEXT_EDITING_BETA)
-            request["context_management"] = {"edits": [{
-                "type": "clear_tool_uses_20250919",
-                "trigger": {"type": "input_tokens", "value": context_policy.clear_tool_results_at},
-                "keep": {"type": "tool_uses", "value": context_policy.keep_tool_results},
-                "clear_at_least": {"type": "input_tokens", "value": context_policy.clear_at_least},
-            }]}
+        _clear_tool_results(request, context_policy)
 
         turn = _Turn(run_id)
         for _round in range(settings.anthropic_max_pause_continuations + 1):
@@ -754,6 +759,34 @@ class AnthropicProvider(StreamingTurnProvider):
             logger.warning("compaction returned no summary — scope=%s stop=%s", run_id, response.stop_reason)
             return None
         return response.content[0].model_dump(exclude_none=True)
+
+    async def count_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        system: str,
+        tools: list[ToolDefinition],
+        model: str | None,
+        image_resolver: ImageResolver | None = None,
+        builtin_tools: list[str] | None = None,
+        timezone: str | None = None,
+        reasoning_effort: str | None = None,
+        context_policy: ContextPolicy | None = None,
+    ) -> int:
+        """The input tokens a call over ``messages`` would send — the very
+        request a turn builds, its tool results cleared as the policy clears
+        them, counted without running it (free, unbilled)."""
+        if not model:
+            raise ValueError("anthropic provider requires an explicit model")
+        spec = await self._spec(model)
+        request = await self._request(
+            spec, messages=messages, system=system, tools=tools, model=model,
+            image_resolver=image_resolver, builtin_tools=builtin_tools,
+            timezone=timezone, reasoning_effort=reasoning_effort, output_schema=None,
+        )
+        request.pop("max_tokens", None)
+        _clear_tool_results(request, context_policy)
+        counted = await self._client.beta.messages.count_tokens(**request)
+        return int(counted.input_tokens)
 
     async def _record_compaction_usage(self, response: Any, run_id: uuid.UUID, model: str) -> None:
         """A compaction reports its call under ``usage.iterations`` (the top

@@ -272,6 +272,40 @@ class LLMRouter:
             logger.exception("compaction failed — provider %s scope %s", provider_id, run_id)
             return None
 
+    async def count_prompt(
+        self,
+        *,
+        provider_id: uuid.UUID,
+        messages: list[dict[str, Any]],
+        system: str,
+        tools: list[ToolDefinition],
+        model: str,
+        image_resolver: Callable[[str], Any] | None = None,
+        builtin_tools: list[str] | None = None,
+        timezone: str | None = None,
+        reasoning_effort: str | None = None,
+        context_policy: ContextPolicy | None = None,
+    ) -> int | None:
+        """The input tokens a call over ``messages`` would send, counted by
+        the provider without running it — or ``None`` when the provider can't
+        count or the count failed. Never raises (aborts aside)."""
+        impl = await self.resolve_chat_provider(provider_id)
+        count = getattr(impl, "count_prompt", None)
+        if count is None:
+            return None
+        try:
+            return await count(
+                messages=messages, system=system, tools=tools, model=model,
+                image_resolver=image_resolver, builtin_tools=builtin_tools,
+                timezone=timezone, reasoning_effort=reasoning_effort,
+                context_policy=context_policy,
+            )
+        except AbortSignalError:
+            raise
+        except Exception:
+            logger.warning("prompt count failed — provider %s", provider_id, exc_info=True)
+            return None
+
     async def embed(self, text: str) -> list[float]:
         if self._embedding_provider is None:
             raise RuntimeError(

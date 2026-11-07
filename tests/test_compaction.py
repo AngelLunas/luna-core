@@ -4,7 +4,8 @@ What must hold: a compacted history starts at its marker and keeps the turns
 after it; the provider replays its own signed summary on the model that wrote
 it and plain text on any other; attachment labels keep counting past the
 summarized photos; a turn compacts only when the last call reached the
-policy's size, and a failed compaction leaves the history whole; the client
+policy's size and the answering agent's own call, counted, does too, with
+enough to spare; a failed compaction leaves the history whole; the client
 never sees the summary.
 """
 from __future__ import annotations
@@ -197,7 +198,11 @@ def _conversation() -> list[_Row]:
     ]
 
 
-def _runner(native: dict | None) -> tuple[ChatRunner, list]:
+def _runner(
+    native: dict | None, counts: dict[int, int | None] | None = None
+) -> tuple[ChatRunner, list]:
+    """``counts`` maps a history's length to what the provider counts for it
+    (``None``: it can't count)."""
     runner = ChatRunner(llm_router=None, mcp_client=None)
     calls: list = []
 
@@ -205,7 +210,11 @@ def _runner(native: dict | None) -> tuple[ChatRunner, list]:
         calls.append(history)
         return native
 
+    async def count_prompt(agent, history, **kw):
+        return (counts or {}).get(len(history))
+
     runner._runner.compact = compact
+    runner._runner.count_prompt = count_prompt
     return runner, calls
 
 
@@ -245,6 +254,70 @@ async def test_under_the_size_nothing_happens():
         policy=ContextPolicy(compact_at=85_000),
     )
     assert kept == rows and not calls and not io.events
+
+
+@pytest.mark.asyncio
+async def test_another_agents_big_call_does_not_compact_a_lighter_one():
+    # The last call was another agent's, with a heavier prompt: this agent's
+    # own call over the same history counts under the size.
+    rows = _conversation()
+    runner, calls = _runner(NATIVE, counts={4: 67_000, 1: 60_000})
+    io = _IO(5)
+    kept = await runner._compact_if_due(
+        AGENT, uuid.uuid4(), rows, io, _DB(rows, last_call_tokens=93_000),
+        system_prompt=None, timezone=None, image_resolver=None,
+        policy=ContextPolicy(compact_at=85_000),
+    )
+    assert kept == rows and not calls and not io.events
+
+
+@pytest.mark.asyncio
+async def test_a_prompt_mostly_system_and_tools_is_not_compacted():
+    rows = _conversation()
+    runner, calls = _runner(NATIVE, counts={4: 90_000, 1: 80_000})
+    io = _IO(5)
+    kept = await runner._compact_if_due(
+        AGENT, uuid.uuid4(), rows, io, _DB(rows, last_call_tokens=90_000),
+        system_prompt=None, timezone=None, image_resolver=None,
+        policy=ContextPolicy(compact_at=85_000, compact_min_gain=20_000),
+    )
+    assert kept == rows and not calls and not io.events
+
+
+@pytest.mark.asyncio
+async def test_a_counted_call_past_the_size_with_room_to_spare_compacts():
+    rows = _conversation()
+    runner, calls = _runner(NATIVE, counts={4: 90_000, 1: 60_000})
+    io = _IO(5)
+    kept = await runner._compact_if_due(
+        AGENT, uuid.uuid4(), rows, io, _DB(rows, last_call_tokens=90_000),
+        system_prompt=None, timezone=None, image_resolver=None,
+        policy=ContextPolicy(compact_at=85_000, compact_min_gain=20_000),
+    )
+    assert len(calls) == 1 and kept == [io.saved[0], rows[3]]
+
+
+@pytest.mark.asyncio
+async def test_count_prompt_counts_the_turns_own_request_as_cleared():
+    client = _FakeClient([])
+    sent: list[dict[str, Any]] = []
+
+    async def count_tokens(**request):
+        sent.append(request)
+        return SimpleNamespace(input_tokens=61_732)
+
+    client.beta.messages.count_tokens = count_tokens
+    tool = ToolDefinition(name="t", description="d", input_schema={"type": "object"})
+    counted = await _provider(client).count_prompt(
+        messages=[{"role": "user", "content": [{"type": "text", "text": "hola"}]}],
+        system="s", tools=[tool], model="model-a",
+        context_policy=ContextPolicy(clear_tool_results_at=70_000),
+    )
+    assert counted == 61_732
+    assert "max_tokens" not in sent[0]
+    # Counted as billed: with the old tool results the call would clear.
+    assert sent[0]["context_management"]["edits"][0]["trigger"]["value"] == 70_000
+    assert sent[0]["system"][0]["text"] == "s" and sent[0]["tools"][0]["name"] == "t"
 
 
 @pytest.mark.asyncio

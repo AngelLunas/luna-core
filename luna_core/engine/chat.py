@@ -23,6 +23,8 @@ the protocol) and ignored.
 """
 from __future__ import annotations
 
+import asyncio
+import functools
 import logging
 import uuid
 from dataclasses import dataclass
@@ -401,13 +403,36 @@ class ChatRunner:
         ``policy.compact_at`` tokens. The summary covers exactly the messages
         of that call — everything but the last reply, which stays after the
         marker word for word. Any failure leaves the history as it was: the
-        turn still answers, at full length."""
+        turn still answers, at full length.
+
+        The last call may have been another agent's, on another model with
+        another prompt, so a call past the size is only a cue: this agent's
+        own call is counted, whole and compacted, and it compacts only when
+        the whole one reaches the size and compacting spares at least
+        ``policy.compact_min_gain``. A turn under the size counts nothing."""
         if not policy or not policy.compact_at or len(rows) < 3:
             return rows
         if await self._last_call_tokens(db, conversation_id, rows) < policy.compact_at:
             return rows
         summarized = rows[:-1] if rows[-1].role is ConversationMessageRole.assistant else rows
         kept = rows[len(summarized):]
+        count = functools.partial(
+            self._runner.count_prompt, agent, db=db, system_prompt=system_prompt,
+            image_resolver=image_resolver, timezone=timezone, context_policy=policy,
+        )
+        whole, compacted = await asyncio.gather(
+            count([_canonical(row) for row in rows]),
+            count([_canonical(row) for row in kept]),
+        )
+        if whole is not None and (
+            whole < policy.compact_at
+            or (compacted is not None and whole - compacted < policy.compact_min_gain)
+        ):
+            logger.info(
+                "compaction skipped — conversation=%s agent=%s prompt=%s compacted=%s",
+                conversation_id, agent.name, whole, compacted,
+            )
+            return rows
         await io.emit(RunEventType.compaction_started, node_id=_CHAT_NODE, payload={})
         native = await self._runner.compact(
             agent,

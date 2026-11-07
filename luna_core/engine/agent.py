@@ -764,6 +764,38 @@ class AgentRunner:
                 instructions=instructions,
             )
 
+    async def count_prompt(
+        self,
+        agent: Agent,
+        history: list[dict[str, Any]],
+        db: AsyncSession,
+        system_prompt: str | None = None,
+        context_tool_names: list[str] | None = None,
+        image_resolver: Any | None = None,
+        timezone: str | None = None,
+        context_policy: ContextPolicy | None = None,
+    ) -> int | None:
+        """The input tokens the agent's next call over ``history`` would send
+        — its own model, system prompt and tools, its tool results cleared
+        as ``context_policy`` clears them — counted by its provider without
+        running it; ``None`` when it can't be counted."""
+        llm_tools, _ = await self._resolve_tools(db, agent.id, context_tool_names)
+        resolved_system = (
+            system_prompt if system_prompt is not None else build_system_prompt(agent)
+        )
+        return await self._llm.count_prompt(
+            provider_id=agent.llm_provider_id,
+            messages=history,
+            system=resolved_system,
+            tools=llm_tools,
+            model=agent.model,
+            image_resolver=image_resolver,
+            builtin_tools=list(getattr(agent, "builtin_tools", None) or []) or None,
+            timezone=timezone,
+            reasoning_effort=getattr(agent, "reasoning_effort", None),
+            context_policy=context_policy,
+        )
+
     # ------------------------------------------------------------------ helpers
     async def _resolve_tools(
         self,

@@ -13,7 +13,12 @@ agent by the host (its price tier, its budget) and carried out by the provider:
   next turn first summarizes everything before it into one compaction block;
   from then on the history starts at that block. The summarized messages stay
   stored; the model no longer receives them. ``compaction_instructions``
-  replaces the provider's own summarization prompt.
+  replaces the provider's own summarization prompt. The last call may have
+  been another agent's (another model, another prompt), so before compacting
+  the provider counts what the answering agent's call would send, whole and
+  compacted: under ``compact_at`` nothing happens, and neither does it when
+  compacting would spare fewer than ``compact_min_gain`` tokens (a prompt
+  that is mostly system and tools, which no summary shrinks).
 
 A provider that has neither lever ignores the policy.
 """
@@ -28,6 +33,7 @@ class ContextPolicy:
     keep_tool_results: int = 4
     clear_at_least: int = 15_000
     compact_at: int | None = None
+    compact_min_gain: int = 0
     compaction_instructions: str | None = None
 
 
