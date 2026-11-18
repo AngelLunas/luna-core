@@ -38,6 +38,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from luna_core.engine.streaming import AgentIO
+from luna_core.engine.tool_input import read_tool_input
 from luna_core.llm.context import ContextPolicy
 from luna_core.llm.base import ToolDefinition as LLMToolDefinition
 from luna_core.llm.router import LLMRouter
@@ -368,6 +369,35 @@ class AgentRunner:
                 gated = [
                     tu for tu in tool_uses if tu.get("name", "") in approval_names
                 ]
+                # A proposal that cannot run is never put to the user: the
+                # model gets the problem back and sends the call again.
+                schemas = {t.name: t.input_schema for t in llm_tools}
+                unreadable: dict[str, list[str]] = {}
+                for tu in gated:
+                    read, problems = read_tool_input(
+                        tu.get("input") or {}, schemas.get(tu.get("name", ""), {})
+                    )
+                    if problems:
+                        unreadable[tu.get("id", "")] = problems
+                    else:
+                        tu["input"] = read
+                if unreadable:
+                    tool_result_blocks = await self._refuse_unreadable(
+                        tool_uses,
+                        unreadable=unreadable,
+                        approval_names=approval_names,
+                        system_by_name=system_by_name,
+                        call_context=call_context,
+                        emitter=emitter,
+                        node_id=node_id,
+                    )
+                    await emitter.save_message(
+                        node_id=node_id,
+                        role=AgentMessageRole.user,
+                        content=tool_result_blocks,
+                    )
+                    messages.append({"role": "user", "content": tool_result_blocks})
+                    continue
                 # An approval request never reaches the user without words:
                 # when the model went straight to its gated calls, it is asked
                 # once for the message the user reads beside them.
@@ -382,6 +412,8 @@ class AgentRunner:
                         node_id=node_id,
                         emitter=emitter,
                         timezone=call_context.get("timezone"),
+                        image_resolver=image_resolver,
+                        context_policy=context_policy,
                     )
                 created = await create_pending_approvals(
                     db,
@@ -443,11 +475,18 @@ class AgentRunner:
         node_id: str,
         emitter: AgentIO,
         timezone: str | None,
+        image_resolver: Any | None = None,
+        context_policy: ContextPolicy | None = None,
     ) -> None:
         """One text-only completion for a turn that paused for approval with
         no words: the calls are answered as not run yet, and the model writes
         what the user reads beside them. Best-effort — the approvals stand
-        either way."""
+        either way.
+
+        It sends the turn's call exactly as the turn sent it (builtin tools,
+        context policy, image resolver) plus the answer: the provider's prompt
+        cache matches from byte 0, so the whole conversation is read from
+        cache instead of paid again."""
         add = getattr(emitter, "add_text_to_last_assistant", None)
         live = getattr(emitter, "live_only", None)
         if add is None or live is None:
@@ -482,8 +521,11 @@ class AgentRunner:
                 run_id=scope_id,
                 node_id=node_id,
                 make_io=stream.for_session,
+                image_resolver=image_resolver,
+                builtin_tools=list(getattr(agent, "builtin_tools", None) or []) or None,
                 timezone=timezone,
                 reasoning_effort=getattr(agent, "reasoning_effort", None),
+                context_policy=context_policy,
             )
         except Exception:  # noqa: BLE001 — words are a courtesy, never a failure
             logger.warning("no words beside the approval for %s", agent.name, exc_info=True)
@@ -493,6 +535,62 @@ class AgentRunner:
         )
         if text:
             await add(text)
+
+    async def _refuse_unreadable(
+        self,
+        tool_uses: list[dict[str, Any]],
+        *,
+        unreadable: dict[str, list[str]],
+        approval_names: set[str],
+        system_by_name: dict[str, SystemTool],
+        call_context: dict[str, Any],
+        emitter: AgentIO,
+        node_id: str,
+    ) -> list[dict[str, Any]]:
+        """The turn's results when a gated call cannot be read: that call gets
+        its problems, the other gated calls wait for the corrected turn (they
+        are proposed together), and the calls that need no approval run."""
+        ran = {
+            block["tool_use_id"]: block
+            for block in (
+                await self._execute_tool_uses(
+                    [tu for tu in tool_uses if tu.get("name", "") not in approval_names],
+                    decisions=None,
+                    system_by_name=system_by_name,
+                    call_context=call_context,
+                    emitter=emitter,
+                    node_id=node_id,
+                )
+            )[0]
+        }
+        blocks: list[dict[str, Any]] = []
+        for tu in tool_uses:
+            call_id = tu.get("id", "")
+            if call_id in ran:
+                blocks.append(ran[call_id])
+                continue
+            problems = unreadable.get(call_id)
+            content = (
+                "Not run and not shown to the user: its input cannot be read. "
+                + "; ".join(problems)
+                + ". Send this call again with each of those fields as real JSON, not text."
+                if problems
+                else "Not run: another call of this turn must be fixed first. Send it again with that one."
+            )
+            blocks.append(
+                {"type": "tool_result", "tool_use_id": call_id, "content": content, "is_error": True}
+            )
+            await emitter.emit(
+                RunEventType.tool_result,
+                node_id=node_id,
+                payload={
+                    "tool_use_id": call_id,
+                    "name": tu.get("name", ""),
+                    "is_error": True,
+                    "output_preview": _preview(content),
+                },
+            )
+        return blocks
 
     async def _execute_tool_uses(
         self,
@@ -545,6 +643,14 @@ class AgentRunner:
                     },
                 )
                 continue
+
+            # The approval holds the input as it was read before it was put to
+            # the user (JSON text decoded); the stored call is read the same
+            # way, so only a real correction by the user counts as an edit.
+            if decision is not None and tool_name in system_by_name:
+                tool_input, _ = read_tool_input(
+                    tool_input, system_by_name[tool_name].input_schema
+                )
 
             # Approved with corrected inputs (the user fixed the call in the
             # app's own form): it runs as approved, and says so in its result.
