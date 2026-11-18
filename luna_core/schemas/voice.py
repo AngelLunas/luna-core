@@ -2,13 +2,22 @@
 
 Control travels as JSON text frames; audio travels as raw binary WS frames
 (PCM16LE mono 24kHz) with a base64-in-JSON fallback for clients that can't
-send binary. The server accumulates upstream deltas per turn and sends the
-full running text in each ``partial``, so clients just replace — no delta
-assembly on their side. ``session_closed`` is always the last frame.
+send binary. ``session_closed`` is always the last frame.
+
+Two modes, chosen by the client in ``start``:
+
+- ``turns`` (default): one ``partial`` per in-flight voice turn (the full
+  running text of that turn — replace, don't append) and one ``final`` per
+  turn. The client joins the turns itself.
+- ``dictation``: the server sends ``draft`` with the whole session's running
+  text, already joined, while the user talks; after ``stop`` it sends one
+  ``transcript`` with the whole recording transcribed in one pass, which
+  replaces the draft. Clients just paint what arrives.
 """
 from __future__ import annotations
 
 import json
+from enum import StrEnum
 from typing import Annotated, Literal, Union
 
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
@@ -21,12 +30,18 @@ class InvalidVoiceFrame(ValueError):
 # ── Client → server ─────────────────────────────────────────────────────────
 
 
+class VoiceMode(StrEnum):
+    turns = "turns"
+    dictation = "dictation"
+
+
 class VoiceStart(BaseModel):
-    """Must be the first frame. Only ``language`` is client-settable — model
-    and provider are server policy (cost control)."""
+    """Must be the first frame. Only ``language`` and ``mode`` are
+    client-settable — model and provider are server policy (cost control)."""
 
     type: Literal["start"]
     language: str | None = Field(default=None, min_length=2, max_length=16)
+    mode: VoiceMode = VoiceMode.turns
 
 
 class VoiceAudioJson(BaseModel):
@@ -95,6 +110,24 @@ class VoiceFinal(BaseModel):
     usage: VoiceUsage | None = None
 
 
+class VoiceDraft(BaseModel):
+    """Dictation mode: the whole session's running text — replace, don't
+    append. Provisional: the ``transcript`` after ``stop`` supersedes it."""
+
+    type: Literal["draft"] = "draft"
+    text: str
+
+
+class VoiceTranscript(BaseModel):
+    """Dictation mode: the definitive text of the whole recording, sent once
+    after ``stop``. ``fallback`` is true when the one-pass transcription did
+    not land in time and the text is the joined draft instead."""
+
+    type: Literal["transcript"] = "transcript"
+    text: str
+    fallback: bool = False
+
+
 class VoiceError(BaseModel):
     type: Literal["error"] = "error"
     code: Literal["stt_unavailable", "upstream_error", "bad_frame", "start_timeout"]
@@ -117,6 +150,8 @@ ServerFrame = Union[
     VoiceSpeechStopped,
     VoicePartial,
     VoiceFinal,
+    VoiceDraft,
+    VoiceTranscript,
     VoiceError,
     VoiceSessionClosed,
 ]

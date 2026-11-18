@@ -1,10 +1,17 @@
 """Realtime voice-transcription proxy (client WS ↔ OpenAI Realtime WS).
 
-Generic infrastructure: nothing app-specific lives here. The client speaks the
+Generic infrastructure: nothing app-specific lives here (domain vocabulary
+comes from the host through ``services.voice_context``). The client speaks the
 protocol in ``luna_core.schemas.voice`` (JSON control + binary PCM16 frames);
-upstream is OpenAI's Realtime API in transcription mode. The proxy is two
+upstream is OpenAI's Realtime API in transcription mode. Each session is
 concurrent pumps plus a hard session deadline — the idle timeout rides on the
 client pump's ``wait_for`` so any client frame resets it.
+
+``turns`` mode bridges one upstream session cut by server VAD. ``dictation``
+mode feeds the same audio to two upstream sessions: a VAD one whose turns are
+joined into a live draft, and one without turn detection that transcribes the
+whole recording in a single pass when the user stops — per-turn transcripts
+punctuate every pause as a sentence end, the single pass does not.
 
 Cost containment is structural: the upstream socket is ALWAYS closed in the
 ``finally`` (a vanished client can't leave a billing session open), sessions
@@ -19,11 +26,16 @@ Realtime API drifts, the fix lands in those two functions only.
 """
 from __future__ import annotations
 
+import array
 import asyncio
 import base64
 import json
 import logging
+import math
+import re
+import sys
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -35,6 +47,7 @@ from luna_core.schemas.voice import (
     InvalidVoiceFrame,
     ServerFrame,
     VoiceAudioJson,
+    VoiceDraft,
     VoiceError,
     VoiceFinal,
     VoicePartial,
@@ -43,9 +56,11 @@ from luna_core.schemas.voice import (
     VoiceSpeechStarted,
     VoiceSpeechStopped,
     VoiceStop,
+    VoiceTranscript,
     VoiceUsage,
     parse_client_frame,
 )
+from luna_core.services.voice_context import VoiceContext
 from luna_core.services.llm_provider import (
     LLMProviderNotFound,
     get_decrypted_api_key,
@@ -64,6 +79,7 @@ class SttSessionConfig:
     api_key: str
     model: str
     url: str
+    noise_reduction: str | None = None
 
 
 async def resolve_stt_session(db: AsyncSession) -> SttSessionConfig:
@@ -87,32 +103,74 @@ async def resolve_stt_session(db: AsyncSession) -> SttSessionConfig:
         api_key=api_key,
         model=settings.voice_stt_model,
         url=settings.voice_stt_realtime_url,
+        noise_reduction=settings.voice_stt_noise_reduction or None,
     )
 
 
 # ── Pure translation layer (unit-testable, no I/O) ──────────────────────────
 
 
-def build_session_update(model: str, language: str | None) -> dict[str, Any]:
-    """GA Realtime transcription-session config (PCM16 mono 24kHz, server
-    VAD). Verified against the 2026 docs: ``session.update`` with
-    ``session.type: "transcription"`` and audio config nested under
-    ``audio.input``."""
+# Models of the gpt-4o / whisper generation take a single ``language`` and no
+# ``keywords``; their successors (gpt-transcribe, gpt-live-transcribe) take a
+# ``languages`` list and ``keywords``.
+_SINGLE_LANGUAGE_MODEL_PREFIXES = ("gpt-4o", "whisper")
+# The Realtime API rejects a session whose keyword contains any of these.
+_KEYWORD_FORBIDDEN = re.compile(r"[<>\r\n]")
+
+
+def _clean_keywords(keywords: Iterable[str]) -> list[str]:
+    seen: dict[str, None] = {}
+    for keyword in keywords:
+        keyword = keyword.strip()
+        if keyword and not _KEYWORD_FORBIDDEN.search(keyword):
+            seen.setdefault(keyword, None)
+    return list(seen)
+
+
+def build_session_update(
+    model: str,
+    language: str | None,
+    *,
+    vad: bool = True,
+    vad_silence_ms: int | None = None,
+    context: VoiceContext | None = None,
+    noise_reduction: str | None = None,
+) -> dict[str, Any]:
+    """GA Realtime transcription-session config (PCM16 mono 24kHz).
+    ``session.update`` with ``session.type: "transcription"`` and audio config
+    nested under ``audio.input``. ``vad=False`` leaves turn detection off: the
+    buffer is transcribed only when the proxy commits it. ``vad_silence_ms``
+    is how long a silence closes a turn (the API's default when None)."""
+    single_language = model.startswith(_SINGLE_LANGUAGE_MODEL_PREFIXES)
     transcription: dict[str, Any] = {"model": model}
     if language:
-        transcription["language"] = language
+        if single_language:
+            transcription["language"] = language
+        else:
+            transcription["languages"] = [language]
+    keywords = _clean_keywords(context.keywords) if context else []
+    prompt = (context.prompt or "").strip() if context else ""
+    if keywords and single_language:
+        # No keyword field on these models: the terms ride in the prompt.
+        prompt = " ".join(filter(None, [prompt, ", ".join(keywords) + "."]))
+    elif keywords:
+        transcription["keywords"] = keywords
+    if prompt:
+        transcription["prompt"] = prompt
+    audio_input: dict[str, Any] = {
+        "format": {"type": "audio/pcm", "rate": 24000},
+        "transcription": transcription,
+        "turn_detection": None,
+    }
+    if vad:
+        audio_input["turn_detection"] = {"type": "server_vad"}
+        if vad_silence_ms:
+            audio_input["turn_detection"]["silence_duration_ms"] = vad_silence_ms
+    if noise_reduction:
+        audio_input["noise_reduction"] = {"type": noise_reduction}
     return {
         "type": "session.update",
-        "session": {
-            "type": "transcription",
-            "audio": {
-                "input": {
-                    "format": {"type": "audio/pcm", "rate": 24000},
-                    "transcription": transcription,
-                    "turn_detection": {"type": "server_vad"},
-                }
-            },
-        },
+        "session": {"type": "transcription", "audio": {"input": audio_input}},
     }
 
 
@@ -125,9 +183,27 @@ def audio_frame_to_append(data: bytes) -> str:
     )
 
 
+# Per-minute models (gpt-transcribe) report seconds of audio instead of tokens.
+# The ledger and its prices count tokens, so seconds land as audio tokens at the
+# Realtime API's own audio rate — one token per 100 ms — and the model's price
+# is entered per million of those (USD per minute ÷ 600 × 1e6).
+AUDIO_TOKENS_PER_SECOND = 10
+
+
 def _usage_from_event(event: dict[str, Any]) -> VoiceUsage | None:
     usage = event.get("usage")
-    if not isinstance(usage, dict) or usage.get("type") != "tokens":
+    if not isinstance(usage, dict):
+        return None
+    if usage.get("type") == "duration":
+        try:
+            seconds = float(usage.get("seconds") or 0)
+        except (TypeError, ValueError):
+            return None
+        tokens = math.ceil(seconds * AUDIO_TOKENS_PER_SECOND)
+        return VoiceUsage(
+            input_tokens=tokens, audio_input_tokens=tokens, output_tokens=0, total_tokens=tokens
+        )
+    if usage.get("type") != "tokens":
         return None
 
     def _int(value: Any) -> int:
@@ -203,6 +279,51 @@ def translate_upstream_event(
     return None
 
 
+# A single trailing period — not an ellipsis, which marks a real hesitation.
+_TRAILING_PERIOD = re.compile(r"(?<![.…])\.\s*$")
+
+
+def _lowercase_opening(fragment: str, keep: set[str]) -> str:
+    """Undo the capital a per-turn transcript gives its first word. Acronyms
+    (LED), mixed case (pH), the English "I" and the host's own capitalised
+    terms keep their spelling."""
+    first = fragment.split(maxsplit=1)[0]
+    letters = re.sub(r"\W", "", first)
+    if not letters or not letters[0].isupper() or letters == "I":
+        return fragment
+    if letters.casefold() in keep:
+        return fragment
+    if len(letters) > 1 and not letters[1:].islower():
+        return fragment
+    index = fragment.index(letters[0])
+    return fragment[:index] + letters[0].lower() + fragment[index + 1 :]
+
+
+def join_draft(fragments: Iterable[str], keep_case: Iterable[str] = ()) -> str:
+    """Join per-turn transcripts into one running text. Each turn arrives as a
+    sentence of its own ("bajó a. 45%"); a pause is not a sentence end, so the
+    period between turns goes and the next turn's capital with it. Questions
+    and exclamations keep their marks."""
+    keep = {
+        re.sub(r"\W", "", term.split(maxsplit=1)[0]).casefold()
+        for term in keep_case
+        if term.strip() and term.strip()[0].isupper()
+    }
+    text = ""
+    for fragment in fragments:
+        fragment = fragment.strip()
+        if not fragment:
+            continue
+        if not text:
+            text = fragment
+            continue
+        if _TRAILING_PERIOD.search(text):
+            text = _TRAILING_PERIOD.sub("", text)
+            fragment = _lowercase_opening(fragment, keep)
+        text = f"{text} {fragment}"
+    return text
+
+
 def total_usage(usages: list[VoiceUsage]) -> VoiceUsage | None:
     if not usages:
         return None
@@ -265,6 +386,8 @@ async def run_transcription_session(
     *,
     model: str,
     language: str | None = None,
+    context: VoiceContext | None = None,
+    noise_reduction: str | None = None,
     max_seconds: float | None = None,
     idle_timeout: float | None = None,
     finalize_timeout: float | None = None,
@@ -405,7 +528,13 @@ async def run_transcription_session(
 
     try:
         try:
-            await upstream.send(json.dumps(build_session_update(model, language)))
+            await upstream.send(
+                json.dumps(
+                    build_session_update(
+                        model, language, context=context, noise_reduction=noise_reduction
+                    )
+                )
+            )
             await client.send_text(VoiceReady().model_dump_json())
         except Exception:  # noqa: BLE001
             result.reason = "error"
@@ -478,6 +607,363 @@ async def run_transcription_session(
             await upstream.close()
         except Exception:  # noqa: BLE001
             pass
+    return result
+
+
+_PCM_BYTES_PER_SECOND = 24000 * 2
+
+
+def _rms(pcm: bytes) -> float:
+    """Loudness of a PCM16LE mono chunk."""
+    samples = array.array("h")
+    samples.frombytes(pcm[: len(pcm) - len(pcm) % 2])
+    if sys.byteorder == "big":
+        samples.byteswap()
+    if not samples:
+        return 0.0
+    return math.sqrt(sum(x * x for x in samples) / len(samples))
+
+
+@dataclass
+class _DraftCutter:
+    """Decides when to cut the draft session's buffer while the user talks
+    without pausing, so the draft keeps up instead of waiting for a pause.
+    Past ``soft`` seconds it cuts at the first chunk clearly quieter than the
+    turn so far — usually a gap between words; at ``hard`` seconds it cuts
+    regardless. A cut that splits a word only blurs the draft: the one-pass
+    transcript replaces it."""
+
+    soft: float
+    hard: float
+    audio_bytes: int = 0
+    energy_sum: float = 0.0
+    chunks: int = 0
+
+    def reset(self) -> None:
+        self.audio_bytes = 0
+        self.energy_sum = 0.0
+        self.chunks = 0
+
+    def should_cut(self, pcm: bytes) -> bool:
+        level = _rms(pcm)
+        # Bytes, not summed float seconds: ten 100 ms chunks make exactly 1 s.
+        self.audio_bytes += len(pcm)
+        mean = self.energy_sum / self.chunks if self.chunks else level
+        self.energy_sum += level
+        self.chunks += 1
+        if self.audio_bytes >= self.hard * _PCM_BYTES_PER_SECOND:
+            return True
+        return self.audio_bytes >= self.soft * _PCM_BYTES_PER_SECOND and level < 0.5 * mean
+
+
+@dataclass
+class _DraftTurns:
+    """The VAD session's turns in commit order, each with its final text or,
+    while it is still being transcribed, the deltas received so far."""
+
+    order: list[str] = field(default_factory=list)
+    text: dict[str, str] = field(default_factory=dict)
+    done: set[str] = field(default_factory=set)
+
+    def _track(self, item_id: str) -> None:
+        if item_id not in self.text:
+            self.order.append(item_id)
+            self.text[item_id] = ""
+
+    def committed(self, item_id: str) -> None:
+        self._track(item_id)
+
+    def delta(self, item_id: str, delta: str) -> None:
+        self._track(item_id)
+        if item_id not in self.done:
+            self.text[item_id] += delta
+
+    def completed(self, item_id: str, transcript: str | None) -> None:
+        self._track(item_id)
+        if transcript is not None:
+            self.text[item_id] = transcript
+        self.done.add(item_id)
+
+    def failed(self, item_id: str) -> None:
+        self._track(item_id)
+        self.done.add(item_id)
+
+    def pending(self) -> bool:
+        return any(item_id not in self.done for item_id in self.order)
+
+    def joined(self, keep_case: Iterable[str]) -> str:
+        return join_draft((self.text[i] for i in self.order), keep_case)
+
+
+async def run_dictation_session(
+    client: ClientTransport,
+    draft_upstream: UpstreamTransport,
+    full_upstream: UpstreamTransport,
+    *,
+    model: str,
+    language: str | None = None,
+    context: VoiceContext | None = None,
+    noise_reduction: str | None = None,
+    draft_silence_ms: int | None = None,
+    draft_cut_seconds: tuple[float, float] | None = None,
+    max_seconds: float | None = None,
+    idle_timeout: float | None = None,
+    finalize_timeout: float | None = None,
+) -> SessionResult:
+    """Bridge one dictation session to two upstream sessions fed the same
+    audio. While the user talks the client gets ``draft`` frames (the VAD
+    session's turns joined); after ``stop`` — or when the session hits its
+    maximum duration — it gets one ``transcript`` of the whole recording from
+    the session without turn detection, or the draft if that pass fails or
+    takes longer than ``finalize_timeout``. Always closes both upstreams."""
+    max_seconds = max_seconds if max_seconds is not None else float(settings.voice_stt_max_session_seconds)
+    idle_timeout = idle_timeout if idle_timeout is not None else float(settings.voice_stt_idle_timeout_seconds)
+    finalize_timeout = finalize_timeout if finalize_timeout is not None else settings.voice_stt_finalize_timeout_seconds
+    draft_silence_ms = draft_silence_ms if draft_silence_ms is not None else settings.voice_stt_draft_silence_ms
+    soft_cut, hard_cut = draft_cut_seconds or (
+        settings.voice_stt_draft_cut_after_seconds,
+        settings.voice_stt_draft_cut_max_seconds,
+    )
+    cutter = _DraftCutter(soft=soft_cut, hard=hard_cut)
+    keep_case = context.keywords if context else ()
+
+    started = time.monotonic()
+    result = SessionResult()
+    turns = _DraftTurns()
+    speech_open = False
+    last_draft = ""
+    full_text: str | None = None
+    full_done = asyncio.Event()
+
+    async def send_draft() -> None:
+        nonlocal last_draft
+        text = turns.joined(keep_case)
+        if text != last_draft:
+            last_draft = text
+            await client.send_text(VoiceDraft(text=text).model_dump_json())
+
+    async def pump_client() -> str:
+        while True:
+            try:
+                message = await asyncio.wait_for(client.receive(), timeout=idle_timeout)
+            except asyncio.TimeoutError:
+                return "idle_timeout"
+            if message.get("type") == "websocket.disconnect":
+                return "client_disconnect"
+            payload: str | None = None
+            pcm: bytes | None = None
+            data = message.get("bytes")
+            if data:
+                pcm = data
+                payload = audio_frame_to_append(data)
+            else:
+                text = message.get("text")
+                if text is None:
+                    continue
+                try:
+                    frame = parse_client_frame(text)
+                except InvalidVoiceFrame as exc:
+                    await client.send_text(
+                        VoiceError(code="bad_frame", message=str(exc)).model_dump_json()
+                    )
+                    continue
+                if isinstance(frame, VoiceStop):
+                    return "stopped"
+                if isinstance(frame, VoiceAudioJson):
+                    payload = json.dumps({"type": "input_audio_buffer.append", "audio": frame.data})
+                    try:
+                        pcm = base64.b64decode(frame.data)
+                    except (ValueError, TypeError):
+                        pcm = None
+            if payload is not None:
+                await draft_upstream.send(payload)
+                # Cut only mid-speech: silence is VAD's to close, and a
+                # committed silence can come back as invented words.
+                if pcm and speech_open and cutter.should_cut(pcm):
+                    cutter.reset()
+                    await draft_upstream.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                if not full_done.is_set():
+                    try:
+                        await full_upstream.send(payload)
+                    except Exception:  # noqa: BLE001 — the draft stands in for it
+                        full_done.set()
+
+    async def pump_draft() -> str:
+        nonlocal speech_open
+        while True:
+            try:
+                raw = await draft_upstream.recv()
+            except Exception:  # noqa: BLE001
+                return "upstream_closed"
+            try:
+                event = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            etype = event.get("type")
+            item_id = str(event.get("item_id") or "")
+            if etype == "input_audio_buffer.committed":
+                turns.committed(item_id)
+                cutter.reset()
+            elif etype == "conversation.item.input_audio_transcription.delta":
+                turns.delta(item_id, str(event.get("delta") or ""))
+                await send_draft()
+            elif etype == "conversation.item.input_audio_transcription.completed":
+                transcript = event.get("transcript")
+                turns.completed(item_id, transcript if isinstance(transcript, str) else None)
+                usage = _usage_from_event(event)
+                if usage is not None:
+                    result.turn_usages.append(usage)
+                await send_draft()
+            elif etype == "conversation.item.input_audio_transcription.failed":
+                turns.failed(item_id)
+            elif etype == "input_audio_buffer.speech_started":
+                speech_open = True
+                cutter.reset()
+                await client.send_text(VoiceSpeechStarted().model_dump_json())
+            elif etype == "input_audio_buffer.speech_stopped":
+                speech_open = False
+                await client.send_text(VoiceSpeechStopped().model_dump_json())
+            elif etype == "error":
+                error = event.get("error") if isinstance(event.get("error"), dict) else {}
+                if error.get("code") == "input_audio_buffer_commit_empty":
+                    speech_open = False
+                else:
+                    # The one-pass session still carries the recording.
+                    logger.warning("voice: draft session error: %s", error.get("message"))
+
+    async def pump_full() -> None:
+        nonlocal full_text
+        while True:
+            try:
+                raw = await full_upstream.recv()
+            except Exception:  # noqa: BLE001
+                full_done.set()
+                return
+            try:
+                event = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            etype = event.get("type")
+            if etype == "conversation.item.input_audio_transcription.completed":
+                transcript = event.get("transcript")
+                full_text = transcript if isinstance(transcript, str) else ""
+                usage = _usage_from_event(event)
+                if usage is not None:
+                    result.turn_usages.append(usage)
+                full_done.set()
+            elif etype == "conversation.item.input_audio_transcription.failed":
+                full_done.set()
+            elif etype == "error":
+                error = event.get("error") if isinstance(event.get("error"), dict) else {}
+                if error.get("code") == "input_audio_buffer_commit_empty":
+                    full_text = ""
+                else:
+                    logger.warning("voice: one-pass session error: %s", error.get("message"))
+                full_done.set()
+
+    async def flush_draft(deadline: float) -> None:
+        """Let the draft catch up before it stands in for the transcript."""
+        if speech_open:
+            try:
+                await draft_upstream.send(json.dumps({"type": "input_audio_buffer.commit"}))
+            except Exception:  # noqa: BLE001
+                return
+        while time.monotonic() < deadline and (speech_open or turns.pending()):
+            if draft_task.done():
+                return
+            await asyncio.sleep(0.02)
+
+    client_task: asyncio.Task[str] = asyncio.create_task(pump_client())
+    draft_task: asyncio.Task[str] = asyncio.create_task(pump_draft())
+    full_task: asyncio.Task[None] = asyncio.create_task(pump_full())
+    deadline_task: asyncio.Task[None] = asyncio.create_task(asyncio.sleep(max_seconds))
+    tasks: set[asyncio.Task[Any]] = {client_task, draft_task, full_task, deadline_task}
+
+    try:
+        try:
+            await draft_upstream.send(
+                json.dumps(
+                    build_session_update(
+                        model,
+                        language,
+                        vad_silence_ms=draft_silence_ms,
+                        context=context,
+                        noise_reduction=noise_reduction,
+                    )
+                )
+            )
+            await full_upstream.send(
+                json.dumps(
+                    build_session_update(
+                        model, language, vad=False, context=context, noise_reduction=noise_reduction
+                    )
+                )
+            )
+            await client.send_text(VoiceReady().model_dump_json())
+        except Exception:  # noqa: BLE001
+            result.reason = "error"
+            await _send_best_effort(
+                client,
+                VoiceError(code="upstream_error", message="could not configure upstream session"),
+            )
+            return result
+
+        done, _pending = await asyncio.wait(
+            {client_task, draft_task, deadline_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if deadline_task in done:
+            result.reason = "max_duration"
+        elif client_task in done:
+            result.reason = "upstream_closed" if client_task.exception() else client_task.result()
+        else:
+            result.reason = "upstream_closed"
+
+        if result.reason in ("stopped", "max_duration"):
+            deadline = time.monotonic() + finalize_timeout
+            if not full_done.is_set():
+                try:
+                    await full_upstream.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                except Exception:  # noqa: BLE001
+                    full_done.set()
+            try:
+                await asyncio.wait_for(full_done.wait(), timeout=max(0.0, deadline - time.monotonic()))
+            except asyncio.TimeoutError:
+                pass
+            text = (full_text or "").strip()
+            fallback = False
+            if not text:
+                await flush_draft(deadline)
+                text = turns.joined(keep_case)
+                fallback = bool(text)
+            result.finals += 1
+            await _send_best_effort(client, VoiceTranscript(text=text, fallback=fallback))
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        result.duration_seconds = time.monotonic() - started
+        if result.reason != "client_disconnect":
+            closed_reason = (
+                result.reason
+                if result.reason in ("stopped", "max_duration", "idle_timeout", "upstream_closed", "error")
+                else "error"
+            )
+            await _send_best_effort(
+                client,
+                VoiceSessionClosed(
+                    reason=closed_reason,  # type: ignore[arg-type]
+                    usage_total=total_usage(result.turn_usages),
+                ),
+            )
+            try:
+                await client.close(1000)
+            except Exception:  # noqa: BLE001
+                pass
+        for upstream in (draft_upstream, full_upstream):
+            try:
+                await upstream.close()
+            except Exception:  # noqa: BLE001
+                pass
     return result
 
 

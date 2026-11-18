@@ -148,11 +148,13 @@ class Settings(BaseSettings):
     # provider's base_url is deliberately avoided: the realtime endpoint is not
     # part of the OpenAI-compatible REST surface that base_url promises.
     voice_stt_provider_name: str = "openai"
-    voice_stt_model: str = "gpt-4o-mini-transcribe"
+    voice_stt_model: str = "gpt-transcribe"
     voice_stt_realtime_url: str = (
         "wss://api.openai.com/v1/realtime?intent=transcription"
     )
-    voice_stt_max_session_seconds: int = 120
+    # `near_field` suits a phone held close; empty disables it.
+    voice_stt_noise_reduction: str = "near_field"
+    voice_stt_max_session_seconds: int = 300
     voice_stt_idle_timeout_seconds: int = 15
     voice_stt_start_timeout_seconds: int = 10
     # Upper bound on the post-stop grace period; the session closes as soon
@@ -163,6 +165,14 @@ class Settings(BaseSettings):
     # on it). Only applies when such fresh audio exists; trailing silence that
     # VAD has been ignoring for longer than this closes the session at once.
     voice_stt_vad_settle_seconds: float = 1.0
+    # Dictation's draft session closes a turn on this much silence: shorter
+    # than the API default so the draft shows up at the speaker's small
+    # pauses. The draft is provisional, so a choppy cut costs nothing.
+    voice_stt_draft_silence_ms: int = 250
+    # Talking on without a pause, the draft is cut after this many seconds at
+    # the first quiet chunk, and at the max regardless (see _DraftCutter).
+    voice_stt_draft_cut_after_seconds: float = 2.0
+    voice_stt_draft_cut_max_seconds: float = 4.0
 
     # MCP Server
     mcp_server_url: str = "http://localhost:8765"

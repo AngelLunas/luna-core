@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import json
+import uuid
 
 import pytest
 
@@ -11,6 +12,7 @@ from luna_core.schemas.voice import (
     VoiceAudioJson,
     VoiceError,
     VoiceFinal,
+    VoiceMode,
     VoicePartial,
     VoiceSpeechStarted,
     VoiceSpeechStopped,
@@ -19,9 +21,15 @@ from luna_core.schemas.voice import (
     VoiceUsage,
     parse_client_frame,
 )
+from luna_core.services.voice_context import (
+    VoiceContext,
+    resolve_voice_context,
+    set_voice_context_provider,
+)
 from luna_core.services.voice_transcription import (
     audio_frame_to_append,
     build_session_update,
+    join_draft,
     total_usage,
     translate_upstream_event,
 )
@@ -157,13 +165,29 @@ class TestTranslateUpstreamEvent:
             input_tokens=40, audio_input_tokens=35, output_tokens=3, total_tokens=43
         )
 
-    def test_duration_usage_is_ignored(self) -> None:
+    def test_duration_usage_becomes_audio_tokens(self) -> None:
+        """Per-minute models report seconds; the ledger gets 10 tokens a second."""
         frame = translate_upstream_event(
             {
                 "type": "conversation.item.input_audio_transcription.completed",
                 "item_id": "item_1",
                 "transcript": "hola",
                 "usage": {"type": "duration", "seconds": 3.2},
+            },
+            {},
+        )
+        assert isinstance(frame, VoiceFinal)
+        assert frame.usage == VoiceUsage(
+            input_tokens=32, audio_input_tokens=32, output_tokens=0, total_tokens=32
+        )
+
+    def test_unknown_usage_type_is_ignored(self) -> None:
+        frame = translate_upstream_event(
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "item_1",
+                "transcript": "hola",
+                "usage": {"type": "credits", "amount": 1},
             },
             {},
         )
@@ -237,3 +261,124 @@ class TestTotalUsage:
         total = total_usage([VoiceUsage(input_tokens=1, output_tokens=1, total_tokens=2)])
         assert total is not None
         assert total.audio_input_tokens is None
+
+
+class TestStartMode:
+    def test_mode_defaults_to_turns(self) -> None:
+        frame = parse_client_frame('{"type": "start", "language": "es"}')
+        assert isinstance(frame, VoiceStart)
+        assert frame.mode == VoiceMode.turns
+
+    def test_dictation_mode(self) -> None:
+        frame = parse_client_frame('{"type": "start", "mode": "dictation"}')
+        assert isinstance(frame, VoiceStart)
+        assert frame.mode == VoiceMode.dictation
+
+    def test_unknown_mode_is_invalid(self) -> None:
+        with pytest.raises(InvalidVoiceFrame):
+            parse_client_frame('{"type": "start", "mode": "karaoke"}')
+
+
+class TestSessionUpdateByModel:
+    CONTEXT = VoiceContext(prompt="Diario de cultivo.", keywords=("EC", "perlita", "bad<term", "EC"))
+
+    def _input(self, payload: dict) -> dict:
+        return payload["session"]["audio"]["input"]
+
+    def test_new_models_take_language_list_and_keywords(self) -> None:
+        audio_input = self._input(build_session_update("gpt-transcribe", "es", context=self.CONTEXT))
+        assert audio_input["transcription"] == {
+            "model": "gpt-transcribe",
+            "languages": ["es"],
+            "keywords": ["EC", "perlita"],
+            "prompt": "Diario de cultivo.",
+        }
+
+    def test_older_models_carry_keywords_in_the_prompt(self) -> None:
+        audio_input = self._input(
+            build_session_update("gpt-4o-mini-transcribe", "es", context=self.CONTEXT)
+        )
+        assert audio_input["transcription"] == {
+            "model": "gpt-4o-mini-transcribe",
+            "language": "es",
+            "prompt": "Diario de cultivo. EC, perlita.",
+        }
+
+    def test_without_vad_turn_detection_is_off(self) -> None:
+        audio_input = self._input(build_session_update("gpt-transcribe", "es", vad=False))
+        assert audio_input["turn_detection"] is None
+
+    def test_noise_reduction(self) -> None:
+        audio_input = self._input(
+            build_session_update("gpt-transcribe", "es", noise_reduction="near_field")
+        )
+        assert audio_input["noise_reduction"] == {"type": "near_field"}
+        assert "noise_reduction" not in self._input(build_session_update("gpt-transcribe", "es"))
+
+
+class TestJoinDraft:
+    def test_pause_period_and_capital_go(self) -> None:
+        assert (
+            join_draft(["Cambio el timer del LED.", "A doce horas de luz."])
+            == "Cambio el timer del LED a doce horas de luz."
+        )
+
+    def test_period_before_a_number(self) -> None:
+        assert join_draft(["La humedad bajó a.", "45%, entonces prendí el humidificador."]) == (
+            "La humedad bajó a 45%, entonces prendí el humidificador."
+        )
+
+    def test_question_and_exclamation_stay(self) -> None:
+        assert join_draft(["¿Riego hoy?", "Mañana no puedo."]) == "¿Riego hoy? Mañana no puedo."
+        assert join_draft(["¡Ya floreció!", "Qué bien."]) == "¡Ya floreció! Qué bien."
+
+    def test_ellipsis_stays(self) -> None:
+        assert join_draft(["Le eché...", "No sé cuánto."]) == "Le eché... No sé cuánto."
+
+    def test_acronyms_mixed_case_and_I_keep_their_spelling(self) -> None:
+        assert join_draft(["Medí.", "EC uno punto cuatro."]) == "Medí EC uno punto cuatro."
+        assert join_draft(["Medí.", "pH seis."]) == "Medí pH seis."
+        assert join_draft(["Then.", "I watered."]) == "Then I watered."
+
+    def test_host_terms_keep_their_capital(self) -> None:
+        assert (
+            join_draft(["Compré un frasco de.", "Trichoderma ayer."], keep_case=["Trichoderma"])
+            == "Compré un frasco de Trichoderma ayer."
+        )
+
+    def test_empty_turns_are_skipped(self) -> None:
+        assert join_draft(["", "Hola.", "  "]) == "Hola."
+
+
+class TestVoiceContext:
+    @pytest.mark.asyncio
+    async def test_no_provider_gives_empty_context(self) -> None:
+        set_voice_context_provider(None)
+        assert await resolve_voice_context(uuid.uuid4(), "es") == VoiceContext()
+
+    @pytest.mark.asyncio
+    async def test_failing_provider_gives_empty_context(self) -> None:
+        async def boom(user_id: uuid.UUID, language: str | None) -> VoiceContext:
+            raise RuntimeError("db down")
+
+        set_voice_context_provider(boom)
+        try:
+            assert await resolve_voice_context(uuid.uuid4(), "es") == VoiceContext()
+        finally:
+            set_voice_context_provider(None)
+
+    @pytest.mark.asyncio
+    async def test_provider_gets_user_and_language(self) -> None:
+        seen = []
+
+        async def provider(user_id: uuid.UUID, language: str | None) -> VoiceContext:
+            seen.append((user_id, language))
+            return VoiceContext(keywords=("perlita",))
+
+        user = uuid.uuid4()
+        set_voice_context_provider(provider)
+        try:
+            assert (await resolve_voice_context(user, "es")).keywords == ("perlita",)
+        finally:
+            set_voice_context_provider(None)
+        assert seen == [(user, "es")]

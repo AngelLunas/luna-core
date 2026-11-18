@@ -373,3 +373,245 @@ async def test_stop_mid_utterance_commit_empty_closes() -> None:
     assert result.reason == "stopped"
     assert client.frames("error") == []  # commit_empty never reaches the client
     assert result.duration_seconds < 1.0
+
+
+# ── Dictation mode: a VAD draft session plus a one-pass session ─────────────
+
+from luna_core.services.voice_context import VoiceContext  # noqa: E402
+from luna_core.services.voice_transcription import run_dictation_session  # noqa: E402
+
+
+def _usage(total: int) -> dict[str, Any]:
+    return {
+        "type": "tokens",
+        "input_tokens": total,
+        "input_token_details": {"audio_tokens": total},
+        "output_tokens": 0,
+        "total_tokens": total,
+    }
+
+
+def _draft_turns() -> list[Any]:
+    """Two VAD turns, each transcribed as a sentence of its own."""
+    return [
+        {"type": "input_audio_buffer.speech_started"},
+        {"type": "input_audio_buffer.speech_stopped"},
+        {"type": "input_audio_buffer.committed", "item_id": "d1"},
+        {"type": "conversation.item.input_audio_transcription.delta", "item_id": "d1", "delta": "Cambio el timer"},
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "d1",
+            "transcript": "Cambio el timer del LED.",
+            "usage": _usage(10),
+        },
+        {"type": "input_audio_buffer.speech_started"},
+        {"type": "input_audio_buffer.speech_stopped"},
+        {"type": "input_audio_buffer.committed", "item_id": "d2"},
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "d2",
+            "transcript": "A doce horas de luz.",
+            "usage": _usage(8),
+        },
+    ]
+
+
+def _dictation_client() -> FakeClient:
+    return FakeClient([_audio(b"\x00\x01"), _audio(b"\x02\x03"), _sleep(0.25), _text({"type": "stop"}), HANG])
+
+
+def _run_dictation(client: FakeClient, draft: FakeUpstream, full: FakeUpstream, **overrides: Any):
+    defaults: dict[str, Any] = {
+        "model": "gpt-transcribe",
+        "language": "es",
+        "context": VoiceContext(prompt="Diario de cultivo.", keywords=("LED",)),
+        "max_seconds": 5.0,
+        "idle_timeout": 5.0,
+        "finalize_timeout": 0.3,
+    }
+    defaults.update(overrides)
+    return run_dictation_session(client, draft, full, **defaults)
+
+
+@pytest.mark.asyncio
+async def test_dictation_drafts_then_one_pass_transcript() -> None:
+    client = _dictation_client()
+    draft = FakeUpstream(_draft_turns())
+    full = FakeUpstream(
+        [
+            HANG_UNTIL_COMMIT,
+            {"type": "input_audio_buffer.committed", "item_id": "f1"},
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "f1",
+                "transcript": "Cambio el timer del LED a doce horas de luz.",
+                "usage": _usage(20),
+            },
+        ]
+    )
+    result = await _run_dictation(client, draft, full)
+
+    assert result.reason == "stopped"
+    assert [f["text"] for f in client.frames("draft")] == [
+        "Cambio el timer",
+        "Cambio el timer del LED.",
+        "Cambio el timer del LED a doce horas de luz.",
+    ]
+    assert client.frames("transcript") == [
+        {"type": "transcript", "text": "Cambio el timer del LED a doce horas de luz.", "fallback": False}
+    ]
+    assert client.sent[-1]["type"] == "session_closed"
+    assert client.sent[-1]["usage_total"]["total_tokens"] == 38  # both sessions are billed
+    # Same audio to both; only the draft session cuts turns.
+    assert len(draft.events("input_audio_buffer.append")) == len(full.events("input_audio_buffer.append")) == 2
+    assert draft.events("session.update")[0]["session"]["audio"]["input"]["turn_detection"]["type"] == "server_vad"
+    assert full.events("session.update")[0]["session"]["audio"]["input"]["turn_detection"] is None
+    assert full.events("input_audio_buffer.commit")
+    assert draft.closed and full.closed
+
+
+@pytest.mark.asyncio
+async def test_dictation_falls_back_to_draft_when_one_pass_fails() -> None:
+    client = _dictation_client()
+    draft = FakeUpstream(_draft_turns())
+    full = FakeUpstream(
+        [HANG_UNTIL_COMMIT, {"type": "conversation.item.input_audio_transcription.failed", "item_id": "f1"}]
+    )
+    await _run_dictation(client, draft, full)
+
+    assert client.frames("transcript") == [
+        {"type": "transcript", "text": "Cambio el timer del LED a doce horas de luz.", "fallback": True}
+    ]
+    assert draft.closed and full.closed
+
+
+@pytest.mark.asyncio
+async def test_dictation_falls_back_when_one_pass_is_too_slow() -> None:
+    client = _dictation_client()
+    draft = FakeUpstream(_draft_turns())
+    full = FakeUpstream([HANG])
+    await _run_dictation(client, draft, full, finalize_timeout=0.1)
+
+    transcript = client.frames("transcript")
+    assert transcript[0]["fallback"] is True
+    assert transcript[0]["text"] == "Cambio el timer del LED a doce horas de luz."
+
+
+@pytest.mark.asyncio
+async def test_dictation_keeps_drafting_when_one_pass_session_drops() -> None:
+    client = _dictation_client()
+    draft = FakeUpstream(_draft_turns())
+    full = FakeUpstream([], hang_after=False)
+    result = await _run_dictation(client, draft, full)
+
+    assert result.reason == "stopped"
+    assert client.frames("draft")
+    assert client.frames("transcript")[0]["fallback"] is True
+
+
+@pytest.mark.asyncio
+async def test_dictation_with_nothing_said() -> None:
+    client = FakeClient([_sleep(0.05), _text({"type": "stop"}), HANG])
+    draft = FakeUpstream([])
+    full = FakeUpstream(
+        [HANG_UNTIL_COMMIT, {"type": "error", "error": {"code": "input_audio_buffer_commit_empty"}}]
+    )
+    await _run_dictation(client, draft, full)
+
+    assert client.frames("transcript") == [{"type": "transcript", "text": "", "fallback": False}]
+
+
+@pytest.mark.asyncio
+async def test_dictation_idle_timeout_sends_no_transcript() -> None:
+    client = FakeClient([HANG])
+    draft = FakeUpstream([])
+    full = FakeUpstream([])
+    result = await _run_dictation(client, draft, full, idle_timeout=0.05)
+
+    assert result.reason == "idle_timeout"
+    assert not client.frames("transcript")
+    assert client.sent[-1] == {"type": "session_closed", "reason": "idle_timeout", "usage_total": None}
+    assert draft.closed and full.closed
+
+
+@pytest.mark.asyncio
+async def test_dictation_max_duration_still_transcribes() -> None:
+    client = FakeClient([_audio(b"\x00\x01"), HANG])
+    draft = FakeUpstream([])
+    full = FakeUpstream(
+        [
+            HANG_UNTIL_COMMIT,
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "f1",
+                "transcript": "Hola.",
+            },
+        ]
+    )
+    result = await _run_dictation(client, draft, full, max_seconds=0.1)
+
+    assert result.reason == "max_duration"
+    assert client.frames("transcript") == [{"type": "transcript", "text": "Hola.", "fallback": False}]
+
+
+@pytest.mark.asyncio
+async def test_dictation_client_disconnect_closes_upstreams_silently() -> None:
+    client = FakeClient([_audio(b"\x00\x01"), DISCONNECT])
+    draft = FakeUpstream([])
+    full = FakeUpstream([])
+    result = await _run_dictation(client, draft, full)
+
+    assert result.reason == "client_disconnect"
+    assert not client.frames("transcript")
+    assert not client.frames("session_closed")
+    assert draft.closed and full.closed
+
+
+def _tone(seconds: float, amplitude: int) -> bytes:
+    import array as _array
+
+    return _array.array("h", [amplitude] * int(24000 * seconds)).tobytes()
+
+
+@pytest.mark.asyncio
+async def test_dictation_cuts_the_draft_at_a_quiet_chunk_during_long_speech() -> None:
+    loud, quiet = _tone(0.1, 8000), _tone(0.1, 500)
+    # 2.4 s of steady speech, then a quiet chunk: past the soft limit, cut there.
+    script = [_sleep(0.05)] + [_audio(loud)] * 24 + [_audio(quiet), _audio(loud), _sleep(0.1), _text({"type": "stop"}), HANG]
+    client = FakeClient(script)
+    draft = FakeUpstream([{"type": "input_audio_buffer.speech_started"}])
+    full = FakeUpstream([HANG_UNTIL_COMMIT, {"type": "error", "error": {"code": "input_audio_buffer_commit_empty"}}])
+    await _run_dictation(client, draft, full, draft_cut_seconds=(2.0, 4.0))
+
+    commits = [i for i, e in enumerate(draft.sent) if e["type"] == "input_audio_buffer.commit"]
+    appends_before_cut = [e for e in draft.sent[: commits[0]] if e["type"] == "input_audio_buffer.append"]
+    assert len(appends_before_cut) == 25  # the cut lands right after the quiet chunk
+
+
+@pytest.mark.asyncio
+async def test_dictation_cuts_the_draft_at_the_hard_limit() -> None:
+    loud = _tone(0.1, 8000)
+    script = [_sleep(0.05)] + [_audio(loud)] * 12 + [_sleep(0.1), _text({"type": "stop"}), HANG]
+    client = FakeClient(script)
+    draft = FakeUpstream([{"type": "input_audio_buffer.speech_started"}])
+    full = FakeUpstream(
+        [HANG_UNTIL_COMMIT, {"type": "conversation.item.input_audio_transcription.completed", "item_id": "f1", "transcript": "x"}]
+    )
+    await _run_dictation(client, draft, full, draft_cut_seconds=(0.5, 1.0))
+
+    commits = [i for i, e in enumerate(draft.sent) if e["type"] == "input_audio_buffer.commit"]
+    assert len(commits) == 1  # 1.2 s of steady speech: one cut at 1.0 s
+    appends_before_cut = [e for e in draft.sent[: commits[0]] if e["type"] == "input_audio_buffer.append"]
+    assert len(appends_before_cut) == 10
+
+
+@pytest.mark.asyncio
+async def test_dictation_never_cuts_silence() -> None:
+    quiet = _tone(0.1, 100)
+    script = [_audio(quiet)] * 12 + [_sleep(0.1), _text({"type": "stop"}), HANG]
+    client = FakeClient(script)
+    draft = FakeUpstream([])  # VAD never hears speech
+    full = FakeUpstream([HANG_UNTIL_COMMIT, {"type": "error", "error": {"code": "input_audio_buffer_commit_empty"}}])
+    await _run_dictation(client, draft, full, draft_cut_seconds=(0.2, 0.5))
+
+    assert not draft.events("input_audio_buffer.commit")

@@ -23,14 +23,17 @@ from luna_core.core.security import user_id_from_ws_token
 from luna_core.schemas.voice import (
     InvalidVoiceFrame,
     VoiceError,
+    VoiceMode,
     VoiceStart,
     parse_client_frame,
 )
+from luna_core.services.voice_context import resolve_voice_context
 from luna_core.services.usage import record_usage_counts, usage_context
 from luna_core.services.voice_transcription import (
     SttUnavailable,
     open_upstream,
     resolve_stt_session,
+    run_dictation_session,
     run_transcription_session,
     total_usage,
 )
@@ -80,18 +83,46 @@ async def transcribe(websocket: WebSocket, token: str | None = None) -> None:
         await _send_error_and_close(websocket, "bad_frame", "expected a start frame")
         return
 
+    context = await resolve_voice_context(user_id, frame.language)
+    dictation = frame.mode == VoiceMode.dictation
+
+    upstreams = []
     try:
-        upstream = await open_upstream(config)
+        # Dictation feeds the same audio to a second session that transcribes
+        # the whole recording in one pass when the user stops.
+        for _ in range(2 if dictation else 1):
+            upstreams.append(await open_upstream(config))
     except Exception:  # noqa: BLE001
         logger.exception("voice: upstream connect failed")
+        for upstream in upstreams:
+            try:
+                await upstream.close()
+            except Exception:  # noqa: BLE001
+                pass
         await _send_error_and_close(
             websocket, "upstream_error", "could not reach the transcription service"
         )
         return
 
-    result = await run_transcription_session(
-        websocket, upstream, model=config.model, language=frame.language
-    )
+    if dictation:
+        result = await run_dictation_session(
+            websocket,
+            upstreams[0],
+            upstreams[1],
+            model=config.model,
+            language=frame.language,
+            context=context,
+            noise_reduction=config.noise_reduction,
+        )
+    else:
+        result = await run_transcription_session(
+            websocket,
+            upstreams[0],
+            model=config.model,
+            language=frame.language,
+            context=context,
+            noise_reduction=config.noise_reduction,
+        )
 
     # Flush the session's per-turn usage to the generic ledger. Voice has no
     # run/conversation, so the scope IS the authenticated user.
@@ -117,8 +148,9 @@ async def transcribe(websocket: WebSocket, token: str | None = None) -> None:
 
     total = total_usage(result.turn_usages)
     logger.info(
-        "voice session closed user=%s reason=%s duration=%.1fs turns=%d total_tokens=%d",
+        "voice session closed user=%s mode=%s reason=%s duration=%.1fs turns=%d total_tokens=%d",
         user_id,
+        frame.mode,
         result.reason,
         result.duration_seconds,
         result.finals,
