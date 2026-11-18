@@ -54,3 +54,60 @@ def test_a_dropped_connection_is_told_from_an_api_answer():
     wrapped.__cause__ = ReadError("connection reset")
     assert _is_connection_drop(wrapped)
     assert not _is_connection_drop(ValueError("bad request"))
+
+
+def _searched_history():
+    search = {
+        "type": "native",
+        "native": {
+            "id": "srvtoolu_1",
+            "name": "tool_search_tool_regex",
+            "type": "server_tool_use",
+            "input": {"pattern": "^update_record$"},
+        },
+    }
+    result = {
+        "type": "native",
+        "native": {
+            "type": "tool_search_tool_result",
+            "tool_use_id": "srvtoolu_1",
+            "content": {
+                "type": "tool_search_tool_search_result",
+                "tool_references": [
+                    {"type": "tool_reference", "tool_name": "update_record"},
+                    {"type": "tool_reference", "tool_name": "move_items"},
+                ],
+            },
+        },
+    }
+    call = {"type": "tool_use", "id": "toolu_1", "name": "update_record", "input": {}}
+    return [
+        {"role": "user", "content": [{"type": "text", "text": "do it"}]},
+        {"role": "assistant", "content": [search, result, call]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}]},
+        {"role": "user", "content": [{"type": "text", "text": "and now?"}]},
+    ]
+
+
+def _assistant_blocks(wire):
+    return next(m for m in wire if m["role"] == "assistant")["content"]
+
+
+def test_a_replayed_search_keeps_only_the_tools_this_request_can_load():
+    from luna_core.llm.providers.anthropic import _canonical_to_anthropic_messages
+
+    wire = _canonical_to_anthropic_messages(
+        _searched_history(), None, tools_declared=True, loadable=frozenset({"update_record"})
+    )
+    blocks = _assistant_blocks(wire)
+    assert [b["type"] for b in blocks] == ["server_tool_use", "tool_search_tool_result", "tool_use"]
+    assert blocks[1]["content"]["tool_references"] == [
+        {"type": "tool_reference", "tool_name": "update_record"}
+    ]
+
+
+def test_a_replayed_search_is_left_out_when_this_request_has_no_search():
+    from luna_core.llm.providers.anthropic import _canonical_to_anthropic_messages
+
+    wire = _canonical_to_anthropic_messages(_searched_history(), None, tools_declared=True)
+    assert [b["type"] for b in _assistant_blocks(wire)] == ["tool_use"]

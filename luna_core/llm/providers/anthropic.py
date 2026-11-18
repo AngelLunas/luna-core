@@ -313,8 +313,16 @@ def _canonical_to_anthropic_messages(
     *,
     tools_declared: bool,
     model: str | None = None,
+    loadable: frozenset[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Canonical history → Messages API ``messages``.
+
+    ``loadable`` names the deferred tools this request's search can load
+    (``None``: the request declares no search). A tool search replayed from an
+    earlier turn — another agent's, after a handoff, or before the tools
+    changed — keeps only the references this request can still resolve; with
+    no search declared the search and its result are left out. The API
+    rejects the whole request over a reference to a tool it does not have.
 
     A history that starts at a compaction sends the provider's signed block
     first, as an assistant message of its own — when the request runs on the
@@ -390,7 +398,9 @@ def _canonical_to_anthropic_messages(
                     if btype == "text" and b.get("text"):
                         parts.append({"type": "text", "text": b["text"]})
                 elif native is not None:
-                    parts.append(native)
+                    replayed = _replayable_search(native, loadable)
+                    if replayed is not None:
+                        parts.append(replayed)
                 elif btype == "text" and b.get("text"):
                     parts.append({"type": "text", "text": b["text"]})
                 elif btype == "tool_use":
@@ -409,6 +419,27 @@ def _canonical_to_anthropic_messages(
             if text:
                 result.append({"role": "user", "content": [{"type": "text", "text": text}]})
     return result
+
+
+def _replayable_search(
+    native: dict[str, Any], loadable: frozenset[str] | None
+) -> dict[str, Any] | None:
+    """A replayed block as this request can send it: a tool search (call or
+    result) is dropped when no search is declared, and its result keeps only
+    references to tools the search can load now. Any other block as is."""
+    kind = native.get("type")
+    is_call = kind == "server_tool_use" and native.get("name") == _TOOL_SEARCH["name"]
+    if not is_call and kind != "tool_search_tool_result":
+        return native
+    if loadable is None:
+        return None
+    content = native.get("content")
+    if is_call or not isinstance(content, dict) or "tool_references" not in content:
+        return native
+    refs = [r for r in content["tool_references"] if r.get("tool_name") in loadable]
+    if len(refs) == len(content["tool_references"]):
+        return native
+    return {**native, "content": {**content, "tool_references": refs}}
 
 
 def _dump(block: Any) -> dict[str, Any]:
@@ -830,7 +861,15 @@ class AnthropicProvider(StreamingTurnProvider):
             *_tools_to_anthropic(tools),
         ]
         wire_messages = _canonical_to_anthropic_messages(
-            messages, image_urls or None, tools_declared=bool(wire_tools), model=model
+            messages,
+            image_urls or None,
+            tools_declared=bool(wire_tools),
+            model=model,
+            loadable=(
+                frozenset(t.name for t in tools if t.deferred)
+                if any(t.deferred for t in tools)
+                else None
+            ),
         )
         if not wire_messages:
             # A turn over an empty history — the agent speaking first (a host's
