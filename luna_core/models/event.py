@@ -46,6 +46,11 @@ class RunEventType(str, enum.Enum):
     # run_events), like the *_delta events — so the UI can show "searching the
     # web…" without a DB enum value.
     builtin_tool_call = "builtin_tool_call"
+    # A client tool call while the model is still writing its input
+    # (pub/sub only, like builtin_tool_call): ``started`` when its block
+    # opens, then ``writing`` with what the host's reader makes of the input
+    # so far (see llm.tool_progress). ``tool_called`` follows once it runs.
+    tool_writing = "tool_writing"
     # A conversation was auto-titled after its first turn. Pub/sub-only (never
     # persisted to run_events), like the *_delta events — a fire-and-forget host
     # task generates the title off the critical path and publishes it on the

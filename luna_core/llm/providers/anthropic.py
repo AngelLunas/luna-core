@@ -60,6 +60,7 @@ from luna_core.llm.providers._turn import (
     compaction_text,
 )
 from luna_core.llm.context import ContextPolicy, compaction_block
+from luna_core.llm.tool_progress import ToolWriting
 from luna_core.models.event import AgentMessageRole, RunEventType
 from luna_core.services.usage import record_usage, usage_context, usage_scope
 
@@ -508,6 +509,8 @@ class _Turn:
         self.model: str | None = None
         # server_tool_use id → (tool name, query or url), for the live events.
         self.server_calls: dict[str, tuple[str, str | None]] = {}
+        # Client tool calls being written, for the live progress events.
+        self.writing = ToolWriting()
 
     def add_usage(self, usage: Any) -> None:
         for key, value in (usage.model_dump() if usage is not None else {}).items():
@@ -971,7 +974,12 @@ class AnthropicProvider(StreamingTurnProvider):
             await self._ensure_started(turn, run_id, node_id, redis, build_io)
             block = event.content_block
             btype = getattr(block, "type", None)
-            if btype == "server_tool_use" and block.name == "web_search":
+            if btype == "tool_use":
+                await self._publish_writing(
+                    turn, run_id, node_id, redis,
+                    turn.writing.start(getattr(event, "index", 0), block.id, block.name),
+                )
+            elif btype == "server_tool_use" and block.name == "web_search":
                 await self._publish_builtin(
                     turn, run_id, node_id, redis, {"tool": "web_search", "status": "searching"}
                 )
@@ -1022,6 +1030,12 @@ class AnthropicProvider(StreamingTurnProvider):
                 await self._publish_delta(
                     turn, run_id, node_id, redis, "thinking", delta.thinking
                 )
+            elif dtype == "input_json_delta":
+                payload = turn.writing.feed(
+                    getattr(event, "index", 0), getattr(delta, "partial_json", "") or ""
+                )
+                if payload is not None:
+                    await self._publish_writing(turn, run_id, node_id, redis, payload)
 
     async def _ensure_started(
         self,
@@ -1093,6 +1107,25 @@ class AnthropicProvider(StreamingTurnProvider):
             redis,
             run_id,
             RunEventType.builtin_tool_call,
+            node_id,
+            {"message_id": str(turn.message_id), **payload},
+            seq,
+        )
+
+    async def _publish_writing(
+        self,
+        turn: _Turn,
+        run_id: uuid.UUID,
+        node_id: str,
+        redis: Redis,
+        payload: dict[str, Any],
+    ) -> None:
+        """A client tool call being written (see ``llm.tool_progress``)."""
+        seq = await self._next_delta_sequence(redis, turn.d_key, turn.delta_seq_base)
+        await publish_run_event(
+            redis,
+            run_id,
+            RunEventType.tool_writing,
             node_id,
             {"message_id": str(turn.message_id), **payload},
             seq,

@@ -59,6 +59,7 @@ from luna_core.llm.providers.mcp_catalog import (
     TOOL_NAME_PREFIX,
     build_mcp_config,
 )
+from luna_core.llm.tool_progress import ToolWriting
 from luna_core.models.event import AgentMessageRole, RunEventType
 from luna_core.services.usage import record_usage, usage_scope
 
@@ -736,12 +737,35 @@ class ClaudeCLIProvider(StreamingTurnProvider):
                             redis, run_id, node_id, message_id, d_key, state,
                             {"tool": "web_search", "status": "searching"},
                         )
+                    elif (
+                        block.get("type") == "tool_use"
+                        and str(block.get("name", "")).startswith(TOOL_NAME_PREFIX)
+                    ):
+                        await self._ensure_started(
+                            state, run_id, node_id, redis, build_io, message_id
+                        )
+                        await self._publish_writing(
+                            redis, run_id, node_id, message_id, d_key, state,
+                            state.writing.start(
+                                inner.get("index", 0),
+                                block.get("id", ""),
+                                block["name"][len(TOOL_NAME_PREFIX):],
+                            ),
+                        )
                     continue
                 if inner.get("type") != "content_block_delta":
                     continue
                 delta = inner.get("delta", {})
                 kind = delta.get("type")
-                if kind == "text_delta":
+                if kind == "input_json_delta":
+                    payload = state.writing.feed(
+                        inner.get("index", 0), delta.get("partial_json") or ""
+                    )
+                    if payload is not None:
+                        await self._publish_writing(
+                            redis, run_id, node_id, message_id, d_key, state, payload
+                        )
+                elif kind == "text_delta":
                     text = delta.get("text", "")
                     if not text:
                         continue
@@ -935,6 +959,27 @@ class ClaudeCLIProvider(StreamingTurnProvider):
             seq,
         )
 
+    async def _publish_writing(
+        self,
+        redis: Redis,
+        run_id: uuid.UUID,
+        node_id: str,
+        message_id: uuid.UUID,
+        d_key: str,
+        state: _TurnState,
+        payload: dict[str, Any],
+    ) -> None:
+        """One of our tools' calls being written (see ``llm.tool_progress``)."""
+        seq = await self._next_delta_sequence(redis, d_key, state.delta_seq_base)
+        await publish_run_event(
+            redis,
+            run_id,
+            RunEventType.tool_writing,
+            node_id,
+            {"message_id": str(message_id), **payload},
+            seq,
+        )
+
     async def _ensure_started(
         self,
         state: _TurnState,
@@ -980,6 +1025,8 @@ class _TurnState:
         # In-flight CLI web searches / page reads: tool_use id → query / url.
         self.web_searches: dict[str, str | None] = {}
         self.web_fetches: dict[str, str | None] = {}
+        # Our tools' calls being written, for the live progress events.
+        self.writing = ToolWriting()
         self.message_started = False
         # Timing, for the per-call log line: when the process was started and
         # how long the model's first output took from there.
