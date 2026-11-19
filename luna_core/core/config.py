@@ -38,6 +38,18 @@ class Settings(BaseSettings):
     # saved the new token). Past this window a reuse reads as a stolen token.
     refresh_reuse_grace_seconds: int = 60
 
+    # Sign in with Google / Apple. Comma-separated lists: the client IDs whose
+    # Google ID tokens are accepted (web, iOS, …) and the bundle IDs Apple
+    # tokens may be issued to. Empty turns that provider off.
+    google_client_ids: str = ""
+    apple_bundle_ids: str = ""
+    # The Sign in with Apple key: exchanges the authorization code for a
+    # refresh token and revokes it when the account is deleted. Without it the
+    # sign-in still works, but there is nothing to revoke.
+    apple_team_id: str | None = None
+    apple_key_id: str | None = None
+    apple_private_key: str | None = None
+
     # Credential encryption (Fernet — base64-encoded 32-byte key)
     encryption_key: str = Field(min_length=32)
 

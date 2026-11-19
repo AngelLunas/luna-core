@@ -9,6 +9,7 @@ from fastapi import (
     Response,
     status,
 )
+from sqlalchemy import select
 
 from luna_core.core.config import settings
 from luna_core.core.dependencies import (
@@ -20,6 +21,9 @@ from luna_core.core.dependencies import (
 from luna_core.core.rate_limit import check_rate_limit, reset_rate_limit
 from luna_core.models.user import User
 from luna_core.schemas.auth import (
+    AppleNotification,
+    AppleSignInRequest,
+    GoogleSignInRequest,
     LoginRequest,
     MessageResponse,
     RefreshRequest,
@@ -36,6 +40,7 @@ from luna_core.services.auth import (
     revoke_refresh_token,
     rotate_refresh_token,
 )
+from luna_core.services import social_auth
 from luna_core.services.verification import create_verification_code, verify_code
 
 logger = logging.getLogger(__name__)
@@ -142,6 +147,81 @@ async def register(
     return _token_response(tokens)
 
 
+async def _login_refusal(db: DBSession, email: str) -> str | dict:
+    """Why a password did not sign in. An account with no password, opened
+    with Google or Apple, says so (with a code the client words), instead of
+    reading as a wrong password."""
+    user = await db.scalar(select(User).where(User.email == email.lower().strip()))
+    if user is not None and user.is_active and user.password_hash is None:
+        providers = await social_auth.providers_of(db, user.id)
+        if providers:
+            return {
+                "code": "password_not_set",
+                "providers": providers,
+                "message": "This account signs in with " + " or ".join(providers),
+            }
+    return "Invalid email or password"
+
+
+async def _social_rate_limit(request: Request, redis: RedisClient) -> None:
+    rate = await check_rate_limit(
+        redis,
+        f"rl:social:{get_client_ip(request)}",
+        limit=settings.login_rate_limit_attempts,
+        window_seconds=settings.login_rate_limit_window_seconds,
+    )
+    if not rate.allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many sign-in attempts. Please try again later.",
+            headers={"Retry-After": str(rate.retry_after)},
+        )
+
+
+@router.post("/google", response_model=TokenResponse)
+async def sign_in_with_google(
+    payload: GoogleSignInRequest,
+    request: Request,
+    response: Response,
+    db: DBSession,
+    redis: RedisClient,
+) -> TokenResponse:
+    await _social_rate_limit(request, redis)
+    claims = await social_auth.verify_google(payload.id_token)
+    await social_auth.claim_token_once(redis, payload.id_token)
+    user = await social_auth.sign_in(db, claims)
+    tokens = await issue_tokens(db, user)
+    _set_refresh_cookie(response, tokens)
+    return _token_response(tokens)
+
+
+@router.post("/apple", response_model=TokenResponse)
+async def sign_in_with_apple(
+    payload: AppleSignInRequest,
+    request: Request,
+    response: Response,
+    db: DBSession,
+    redis: RedisClient,
+) -> TokenResponse:
+    await _social_rate_limit(request, redis)
+    claims = await social_auth.verify_apple(payload.identity_token, payload.nonce)
+    await social_auth.claim_token_once(redis, payload.identity_token)
+    user = await social_auth.sign_in(db, claims)
+    await social_auth.store_apple_refresh_token(db, claims, payload.authorization_code)
+    tokens = await issue_tokens(db, user)
+    _set_refresh_cookie(response, tokens)
+    return _token_response(tokens)
+
+
+@router.post("/apple/notifications", response_model=MessageResponse)
+async def apple_notifications(payload: AppleNotification, db: DBSession) -> MessageResponse:
+    """Sign in with Apple's server-to-server notifications (registered on the
+    App ID). Always 200 once the signature checks, so Apple does not retry
+    an event we chose to ignore."""
+    await social_auth.handle_apple_notification(db, payload.payload)
+    return MessageResponse(message="ok")
+
+
 @router.post("/login", response_model=TokenResponse)
 async def login(
     payload: LoginRequest,
@@ -169,7 +249,7 @@ async def login(
     if user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password",
+            detail=await _login_refusal(db, payload.email),
         )
 
     await reset_rate_limit(redis, rate_key)

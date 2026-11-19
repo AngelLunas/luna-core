@@ -21,6 +21,7 @@ from luna_core.models.tool_approval import ToolApproval, ToolApprovalStatus
 from luna_core.models.pricing import LLMPrice
 from luna_core.models.usage import LLMUsage
 from luna_core.models.user import User
+from luna_core.models.user_identity import UserIdentity
 
 __all__ = [
     "Agent",
@@ -51,4 +52,5 @@ __all__ = [
     "ToolApproval",
     "ToolApprovalStatus",
     "User",
+    "UserIdentity",
 ]

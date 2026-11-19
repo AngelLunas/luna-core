@@ -66,7 +66,7 @@ async def authenticate_user(
         # Run bcrypt anyway to avoid trivial timing oracle on user existence
         verify_password(password, "$2b$12$" + "x" * 53)
         return None
-    if not user.is_active:
+    if not user.is_active or user.password_hash is None:
         return None
     if not verify_password(password, user.password_hash):
         return None

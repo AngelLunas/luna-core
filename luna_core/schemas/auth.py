@@ -23,6 +23,24 @@ class TokenResponse(BaseModel):
     user: UserRead
 
 
+class GoogleSignInRequest(BaseModel):
+    id_token: str = Field(min_length=1, max_length=8192)
+
+
+class AppleSignInRequest(BaseModel):
+    identity_token: str = Field(min_length=1, max_length=8192)
+    # One-time code that exchanges for the refresh token we revoke when the
+    # account is deleted (Apple requires it).
+    authorization_code: str | None = Field(default=None, max_length=1024)
+    # The nonce the app asked Apple to sign into this token.
+    nonce: str | None = Field(default=None, max_length=256)
+
+
+class AppleNotification(BaseModel):
+    # Apple's server-to-server notification: a JWT it signs.
+    payload: str = Field(min_length=1, max_length=16384)
+
+
 class RefreshRequest(BaseModel):
     # Mobile clients send the refresh token in the body; web omits it and the
     # httpOnly cookie is used instead.
