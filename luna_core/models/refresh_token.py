@@ -30,6 +30,16 @@ class RefreshToken(Base):
     token_hash: Mapped[str] = mapped_column(
         String(64), unique=True, index=True, nullable=False
     )
+    # One family per sign-in (one device): every rotation stays in it, so a
+    # replayed token signs out that device and leaves the others alone.
+    family_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), nullable=False, index=True
+    )
+    # Set when the token is exchanged for its successor (not on logout), so a
+    # reuse right after a rotation can be told apart from a replay.
+    rotated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )

@@ -1,3 +1,4 @@
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -72,14 +73,21 @@ async def authenticate_user(
     return user
 
 
-async def issue_tokens(db: AsyncSession, user: User) -> IssuedTokens:
+async def issue_tokens(
+    db: AsyncSession, user: User, *, family_id: uuid.UUID | None = None
+) -> IssuedTokens:
+    """A new access/refresh pair. Without ``family_id`` it opens a new session
+    (a sign-in); a rotation passes its own family to stay in it."""
     now = datetime.now(timezone.utc)
     refresh_token = generate_refresh_token()
     refresh_expires_at = now + timedelta(days=settings.refresh_token_expire_days)
 
+    token_id = uuid.uuid4()
     db.add(
         RefreshToken(
+            id=token_id,
             user_id=user.id,
+            family_id=family_id or token_id,
             token_hash=hash_refresh_token(refresh_token),
             expires_at=refresh_expires_at,
             revoked=False,
@@ -97,14 +105,21 @@ async def issue_tokens(db: AsyncSession, user: User) -> IssuedTokens:
     )
 
 
+def _aware(moment: datetime) -> datetime:
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
+def _within_reuse_grace(stored: RefreshToken, now: datetime) -> bool:
+    if stored.rotated_at is None:
+        return False
+    grace = timedelta(seconds=settings.refresh_reuse_grace_seconds)
+    return now - _aware(stored.rotated_at) <= grace
+
+
 async def rotate_refresh_token(
     db: AsyncSession, raw_refresh_token: str
 ) -> IssuedTokens:
-    token_hash = hash_refresh_token(raw_refresh_token)
-
-    stored = await db.scalar(
-        select(RefreshToken).where(RefreshToken.token_hash == token_hash)
-    )
+    stored = await _find_refresh_token(db, hash_refresh_token(raw_refresh_token))
     if stored is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -112,13 +127,15 @@ async def rotate_refresh_token(
         )
 
     now = datetime.now(timezone.utc)
-    expires_at = stored.expires_at
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if _aware(stored.expires_at) <= now:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh token revoked or expired",
+        )
 
-    if stored.revoked or expires_at <= now:
-        # Possible replay — revoke entire family for this user
-        await _revoke_all_user_tokens(db, stored.user_id)
+    if stored.revoked and not _within_reuse_grace(stored, now):
+        # Possible replay: sign out the session it belongs to.
+        await _revoke_family(db, stored.family_id)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Refresh token revoked or expired",
@@ -131,10 +148,25 @@ async def rotate_refresh_token(
             detail="User not found or inactive",
         )
 
+    if stored.revoked:
+        # Reused inside the grace window: the client never saved the token
+        # its rotation returned. It gets a sibling in the same family, and
+        # whichever of the two it keeps revokes the other on its next
+        # rotation. A session already closed (logout, a replay, the account
+        # being deleted) has no live token left and stays closed.
+        if not await _family_is_live(db, stored.family_id):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Refresh token revoked or expired",
+            )
+        return await issue_tokens(db, user, family_id=stored.family_id)
+
     stored.revoked = True
+    stored.rotated_at = now
+    await _revoke_family(db, stored.family_id, keep=stored.id, commit=False)
     await db.flush()
 
-    return await issue_tokens(db, user)
+    return await issue_tokens(db, user, family_id=stored.family_id)
 
 
 async def revoke_refresh_token(db: AsyncSession, raw_refresh_token: str) -> None:
@@ -147,12 +179,36 @@ async def revoke_refresh_token(db: AsyncSession, raw_refresh_token: str) -> None
         await db.commit()
 
 
-async def _revoke_all_user_tokens(db: AsyncSession, user_id) -> None:
-    tokens = await db.scalars(
-        select(RefreshToken).where(
-            RefreshToken.user_id == user_id, RefreshToken.revoked.is_(False)
-        )
+async def _find_refresh_token(db: AsyncSession, token_hash: str) -> RefreshToken | None:
+    return await db.scalar(
+        select(RefreshToken).where(RefreshToken.token_hash == token_hash)
     )
-    for token in tokens:
+
+
+async def _family_is_live(db: AsyncSession, family_id: uuid.UUID) -> bool:
+    live = await db.scalar(
+        select(RefreshToken.id)
+        .where(RefreshToken.family_id == family_id, RefreshToken.revoked.is_(False))
+        .limit(1)
+    )
+    return live is not None
+
+
+async def _revoke_family(
+    db: AsyncSession,
+    family_id: uuid.UUID,
+    *,
+    keep: uuid.UUID | None = None,
+    commit: bool = True,
+) -> None:
+    """Revoke the family's live tokens, except ``keep`` (which the caller
+    revokes itself, with its rotation time)."""
+    query = select(RefreshToken).where(
+        RefreshToken.family_id == family_id, RefreshToken.revoked.is_(False)
+    )
+    if keep is not None:
+        query = query.where(RefreshToken.id != keep)
+    for token in await db.scalars(query):
         token.revoked = True
-    await db.commit()
+    if commit:
+        await db.commit()

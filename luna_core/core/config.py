@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 180  # 3 hours
     refresh_token_expire_days: int = 30
+    # A refresh token used again this soon after its rotation gets a fresh
+    # token of the same session instead of a sign-out: the client most likely
+    # lost the answer (the connection dropped, or the app was killed before it
+    # saved the new token). Past this window a reuse reads as a stolen token.
+    refresh_reuse_grace_seconds: int = 60
 
     # Credential encryption (Fernet — base64-encoded 32-byte key)
     encryption_key: str = Field(min_length=32)
