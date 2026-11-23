@@ -13,6 +13,7 @@ from sqlalchemy import select
 
 from luna_core.core.config import settings
 from luna_core.core.dependencies import (
+    CurrentUser,
     CurrentUserAllowUnverified,
     DBSession,
     RedisClient,
@@ -23,11 +24,14 @@ from luna_core.models.user import User
 from luna_core.schemas.auth import (
     AppleNotification,
     AppleSignInRequest,
+    ChangePasswordRequest,
+    ForgotPasswordRequest,
     GoogleSignInRequest,
     LoginRequest,
     MessageResponse,
     RefreshRequest,
     RegisterRequest,
+    ResetPasswordRequest,
     TokenResponse,
     VerifyEmailRequest,
 )
@@ -40,8 +44,14 @@ from luna_core.services.auth import (
     revoke_refresh_token,
     rotate_refresh_token,
 )
+from luna_core.services import password as passwords
 from luna_core.services import social_auth
-from luna_core.services.verification import create_verification_code, verify_code
+from luna_core.services.password import PasswordEmail, PasswordRefusal
+from luna_core.services.verification import (
+    CodeCheck,
+    create_verification_code,
+    verify_code,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -348,11 +358,141 @@ async def resend_verification(
         redis, f"rl:verify-resend:{current_user.id}", limit=4, window_seconds=600
     )
     if not rate.allowed:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many requests. Please wait before resending.",
-            headers={"Retry-After": str(rate.retry_after)},
-        )
+        raise _too_many_requests(rate.retry_after)
 
     await _dispatch_verification_email(request, db, background, current_user)
     return MessageResponse(message="Verification email sent")
+
+
+# --- forgetting and changing the password ------------------------------------
+
+
+def _too_many_requests(retry_after: int) -> HTTPException:
+    """Over a limit, with the seconds left so the client can say how long to
+    wait."""
+    return HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail={
+            "code": PasswordRefusal.TOO_MANY_REQUESTS,
+            "retry_after": retry_after,
+            "message": "Too many requests. Please wait and try again.",
+        },
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
+async def _limit(redis: RedisClient, key: str, limit: int, window_seconds: int) -> None:
+    rate = await check_rate_limit(redis, key, limit=limit, window_seconds=window_seconds)
+    if not rate.allowed:
+        raise _too_many_requests(rate.retry_after)
+
+
+def _send_password_email(
+    request: Request,
+    background: BackgroundTasks,
+    user: User,
+    kind: PasswordEmail,
+    **extra,
+) -> None:
+    """Hand one of the flow's emails to the host app's hook
+    (``async (email, kind, *, lang, code=None, providers=None)``)."""
+    sender = getattr(request.app.state, "send_password_email", None)
+    if sender is None:
+        logger.warning("no send_password_email hook; %s email not sent", kind)
+        return
+    lang = _primary_language(request.headers.get("accept-language"))
+    background.add_task(sender, user.email, kind, lang=lang, **extra)
+
+
+@router.post("/password/forgot", response_model=MessageResponse)
+async def forgot_password(
+    payload: ForgotPasswordRequest,
+    request: Request,
+    background: BackgroundTasks,
+    db: DBSession,
+    redis: RedisClient,
+) -> MessageResponse:
+    """Email a code that resets the password. The answer is the same whether
+    the address has an account or not; only its owner learns that, in the
+    inbox. An account opened with Google or Apple gets told which button to
+    use instead of a code."""
+    email = payload.email.lower().strip()
+    await _limit(redis, f"rl:pw-forgot-ip:{get_client_ip(request)}", 10, 3600)
+    await _limit(redis, f"rl:pw-forgot:{email}", 4, 600)
+
+    user = await passwords.user_by_email(db, email)
+    if user is not None and user.is_active:
+        providers = (
+            await social_auth.providers_of(db, user.id)
+            if user.password_hash is None
+            else []
+        )
+        if providers:
+            _send_password_email(
+                request, background, user, PasswordEmail.NO_PASSWORD, providers=providers
+            )
+        else:
+            code = await passwords.create_reset_code(db, user)
+            _send_password_email(
+                request, background, user, PasswordEmail.RESET_CODE, code=code
+            )
+    return MessageResponse(message="If the address has an account, an email is on its way")
+
+
+@router.post("/password/reset", response_model=TokenResponse)
+async def reset_password(
+    payload: ResetPasswordRequest,
+    request: Request,
+    response: Response,
+    background: BackgroundTasks,
+    db: DBSession,
+    redis: RedisClient,
+) -> TokenResponse:
+    """Set a new password with the emailed code. Every other session closes
+    and this request signs in."""
+    email = payload.email.lower().strip()
+    await _limit(redis, f"rl:pw-reset:{email}", 15, 600)
+
+    user = await passwords.user_by_email(db, email)
+    if user is None or not user.is_active:
+        check = CodeCheck.NO_CODE
+    else:
+        check = await passwords.reset_password(db, user, payload.code, payload.new_password)
+    if check is not CodeCheck.MATCHED:
+        raise HTTPException(
+            status_code=_VERIFY_ERROR_STATUS.get(check, status.HTTP_400_BAD_REQUEST),
+            detail={"code": check, "message": "The code did not reset the password"},
+        )
+
+    tokens = await issue_tokens(db, user)
+    _send_password_email(request, background, user, PasswordEmail.CHANGED)
+    _set_refresh_cookie(response, tokens)
+    return _token_response(tokens)
+
+
+@router.post("/password/change", response_model=TokenResponse)
+async def change_password(
+    payload: ChangePasswordRequest,
+    request: Request,
+    response: Response,
+    background: BackgroundTasks,
+    db: DBSession,
+    redis: RedisClient,
+    current_user: CurrentUser,
+) -> TokenResponse:
+    """Change the password with the current one. Every session closes,
+    this one included, and the answer carries its replacement."""
+    await _limit(redis, f"rl:pw-change:{current_user.id}", 5, 300)
+    refusal = await passwords.change_password(
+        db, current_user, payload.current_password, payload.new_password
+    )
+    if refusal is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": refusal, "message": "The password was not changed"},
+        )
+
+    tokens = await issue_tokens(db, current_user)
+    _send_password_email(request, background, current_user, PasswordEmail.CHANGED)
+    _set_refresh_cookie(response, tokens)
+    return _token_response(tokens)

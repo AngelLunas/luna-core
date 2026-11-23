@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from sqlalchemy import DateTime, ForeignKey, Integer, String, func
@@ -10,6 +11,11 @@ from luna_core.core.db import Base
 
 if TYPE_CHECKING:
     from luna_core.models.user import User
+
+
+class CodePurpose(StrEnum):
+    VERIFY_EMAIL = "verify_email"
+    PASSWORD_RESET = "password_reset"
 
 
 class EmailVerificationCode(Base):
@@ -34,6 +40,14 @@ class EmailVerificationCode(Base):
         ForeignKey("core.users.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
+    )
+    # What typing the code proves: owning the address, or the right to set a
+    # new password. Each purpose keeps its own single live code.
+    purpose: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default=CodePurpose.VERIFY_EMAIL,
+        server_default=CodePurpose.VERIFY_EMAIL.value,
     )
     code_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(

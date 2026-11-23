@@ -48,6 +48,10 @@ class User(Base):
         nullable=False,
     )
 
+    @property
+    def has_password(self) -> bool:
+        return self.password_hash is not None
+
     refresh_tokens: Mapped[list["RefreshToken"]] = relationship(
         back_populates="user",
         cascade="all, delete-orphan",

@@ -12,6 +12,9 @@ class UserRead(BaseModel):
     role: str
     is_active: bool
     is_verified: bool
+    # False for an account that signs in only with Google or Apple: the
+    # client hides the ways to change a password it does not have.
+    has_password: bool = True
     created_at: datetime
 
 

@@ -72,6 +72,8 @@ class Settings(BaseSettings):
     # force is bounded by the per-code attempt cap plus this short expiry.
     email_verification_code_ttl_minutes: int = 30
     email_verification_max_attempts: int = 5
+    # A password reset code is shorter-lived: typing it changes the password.
+    password_reset_code_ttl_minutes: int = 15
 
     # Celery
     celery_broker_url: str | None = None
