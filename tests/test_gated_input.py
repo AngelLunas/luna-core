@@ -293,8 +293,8 @@ async def test_the_words_call_goes_out_as_the_turn_did():
         name="a", llm_provider_id=None, temperature=0.2, model="m",
         reasoning_effort=None, builtin_tools=["web_search"],
     )
-    await AgentRunner(llm_router=llm, mcp_client=SimpleNamespace())._words_beside_approval(
-        agent=agent, messages=[], tool_uses=[], system="s", tools=[], scope_id=None,
+    await AgentRunner(llm_router=llm, mcp_client=SimpleNamespace())._words_beside(
+        result="r", cue="c", agent=agent, messages=[], tool_uses=[], system="s", tools=[], scope_id=None,
         node_id="chat", emitter=_Conv(), timezone=None,
         image_resolver=resolver, context_policy=policy,
     )

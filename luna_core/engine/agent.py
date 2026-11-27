@@ -67,6 +67,14 @@ _WORDS_BESIDE_APPROVAL = (
 )
 
 
+_AWAITING_APPROVAL = "Not run yet: awaiting the user's approval."
+_SHOWN_WITH_WORDS = (
+    "Not shown yet: it goes on screen with the message you write now, which the user "
+    "reads right above it."
+)
+_WORDS_BESIDE_CALL = "Write now, in the user's language, that message. Text only — no tool calls."
+
+
 def _has_words(blocks: list[dict[str, Any]]) -> bool:
     return any(b.get("type") == "text" and (b.get("text") or "").strip() for b in blocks)
 
@@ -402,10 +410,12 @@ class AgentRunner:
                 # when the model went straight to its gated calls, it is asked
                 # once for the message the user reads beside them.
                 if not _has_words(response_blocks):
-                    await self._words_beside_approval(
+                    await self._words_beside(
                         agent=agent,
                         messages=messages,
                         tool_uses=tool_uses,
+                        result=_AWAITING_APPROVAL,
+                        cue=_WORDS_BESIDE_APPROVAL,
                         system=resolved_system,
                         tools=llm_tools,
                         scope_id=scope_id,
@@ -433,6 +443,33 @@ class AgentRunner:
                         },
                     )
                 return SuspendedForApproval(approvals=created)
+
+            # A call the user sees never reaches them alone: when the model
+            # went straight to it, it is asked once for the words that go with
+            # it, written above the call in the same message.
+            cues = [
+                tool.words_cue
+                for tu in tool_uses
+                if (tool := system_by_name.get(tu.get("name", ""))) is not None and tool.words_cue
+            ]
+            if cues and not _has_words(response_blocks):
+                text = await self._words_beside(
+                    agent=agent,
+                    messages=messages,
+                    tool_uses=tool_uses,
+                    result=_SHOWN_WITH_WORDS,
+                    cue=" ".join(dict.fromkeys(cues)) + " " + _WORDS_BESIDE_CALL,
+                    system=resolved_system,
+                    tools=llm_tools,
+                    scope_id=scope_id,
+                    node_id=node_id,
+                    emitter=emitter,
+                    timezone=call_context.get("timezone"),
+                    image_resolver=image_resolver,
+                    context_policy=context_policy,
+                )
+                if text:
+                    response_blocks.insert(0, {"type": "text", "text": text})
 
             tool_result_blocks, terminal_called, terminal_value = (
                 await self._execute_tool_uses(
@@ -463,12 +500,14 @@ class AgentRunner:
             f"agent exceeded MAX_TOOL_ITERATIONS={MAX_TOOL_ITERATIONS}"
         )
 
-    async def _words_beside_approval(
+    async def _words_beside(
         self,
         *,
         agent: Agent,
         messages: list[dict[str, Any]],
         tool_uses: list[dict[str, Any]],
+        result: str,
+        cue: str,
         system: str,
         tools: list[LLMToolDefinition],
         scope_id: uuid.UUID,
@@ -477,11 +516,13 @@ class AgentRunner:
         timezone: str | None,
         image_resolver: Any | None = None,
         context_policy: ContextPolicy | None = None,
-    ) -> None:
-        """One text-only completion for a turn that paused for approval with
-        no words: the calls are answered as not run yet, and the model writes
-        what the user reads beside them. Best-effort — the approvals stand
-        either way.
+    ) -> str | None:
+        """One text-only completion for a turn whose calls reach the user with
+        no words — paused for approval, or a call they see on screen: the calls
+        are answered with ``result`` (not run yet), and the model writes, as
+        ``cue`` says, what the user reads beside them. Returns the text, also
+        written into the turn's assistant message. Best-effort — the calls
+        stand either way.
 
         It sends the turn's call exactly as the turn sent it (builtin tools,
         context policy, image resolver) plus the answer: the provider's prompt
@@ -490,7 +531,7 @@ class AgentRunner:
         add = getattr(emitter, "add_text_to_last_assistant", None)
         live = getattr(emitter, "live_only", None)
         if add is None or live is None:
-            return  # no conversation to write into (a flow, an ephemeral scope)
+            return None  # no conversation to write into (a flow, an ephemeral scope)
         stream = live()
         ask = [
             *messages,
@@ -501,11 +542,11 @@ class AgentRunner:
                         {
                             "type": "tool_result",
                             "tool_use_id": tu.get("id", ""),
-                            "content": "Not run yet: awaiting the user's approval.",
+                            "content": result,
                         }
                         for tu in tool_uses
                     ),
-                    {"type": "text", "text": _WORDS_BESIDE_APPROVAL},
+                    {"type": "text", "text": cue},
                 ],
             },
         ]
@@ -528,13 +569,14 @@ class AgentRunner:
                 context_policy=context_policy,
             )
         except Exception:  # noqa: BLE001 — words are a courtesy, never a failure
-            logger.warning("no words beside the approval for %s", agent.name, exc_info=True)
-            return
+            logger.warning("no words beside the calls for %s", agent.name, exc_info=True)
+            return None
         text = "\n\n".join(
             b.get("text", "").strip() for b in blocks if b.get("type") == "text" and (b.get("text") or "").strip()
         )
         if text:
             await add(text)
+        return text or None
 
     async def _refuse_unreadable(
         self,

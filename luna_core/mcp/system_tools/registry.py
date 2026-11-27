@@ -72,6 +72,11 @@ class SystemTool:
     handler: SystemToolHandler
     scope: SystemToolScope
     terminal: bool = False
+    # A call the user sees (a question on screen, a form) that must never reach
+    # them without words: when the model calls it with no text of its own, it
+    # is asked once for the message that goes with it, and this cue says what
+    # that message must carry. None: the call needs no words.
+    words_cue: str | None = None
 
 
 class SystemToolRegistry:

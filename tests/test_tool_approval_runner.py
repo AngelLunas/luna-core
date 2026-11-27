@@ -176,8 +176,8 @@ def _agent():
 
 async def _words(llm, emitter):
     runner = AgentRunner(llm_router=llm, mcp_client=SimpleNamespace())
-    await runner._words_beside_approval(
-        agent=_agent(), messages=[{"role": "assistant", "content": [_tool_use("a")]}],
+    await runner._words_beside(
+        result="Not run yet: awaiting the user's approval.", cue="cue", agent=_agent(), messages=[{"role": "assistant", "content": [_tool_use("a")]}],
         tool_uses=[_tool_use("a")], system="s", tools=[], scope_id=None, node_id="chat",
         emitter=emitter, timezone=None,
     )
