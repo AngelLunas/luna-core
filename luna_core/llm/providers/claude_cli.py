@@ -485,11 +485,16 @@ class ClaudeCLIProvider(StreamingTurnProvider):
             ]
         else:
             argv += ["--tools", "", "--max-turns", "1"]
+        # By file: one argv string is capped at 32 pages, 128 KiB on a 4 KiB-page
+        # kernel (Docker Desktop's VM), and a review's prompt runs past that.
+        system_file = os.path.join(work_dir, "system-prompt.md")
+        with open(system_file, "w", encoding="utf-8") as fh:
+            fh.write(system or "")
         argv += [
             "--model",
             model,
-            "--system-prompt",
-            system or "",
+            "--system-prompt-file",
+            system_file,
             "--exclude-dynamic-system-prompt-sections",
         ]
         if reasoning_effort:

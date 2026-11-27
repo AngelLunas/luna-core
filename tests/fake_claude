@@ -46,6 +46,9 @@ if "--mcp-config" in argv:
             if os.path.exists(tools_path):
                 with open(tools_path) as f:
                     record["tools_file"] = json.load(f)
+if "--system-prompt-file" in argv:
+    with open(argv[argv.index("--system-prompt-file") + 1], encoding="utf-8") as f:
+        record["system_prompt"] = f.read()
 if "--json-schema" in argv:
     record["json_schema"] = json.loads(argv[argv.index("--json-schema") + 1])
 

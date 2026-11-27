@@ -213,7 +213,8 @@ async def test_text_turn_returns_blocks_and_records_usage(tmp_path):
     assert argv[argv.index("--input-format") + 1] == "stream-json"
     assert argv[argv.index("--tools") + 1] == ""
     assert argv[argv.index("--model") + 1] == "haiku"
-    assert argv[argv.index("--system-prompt") + 1] == "Eres Savia."
+    assert inv["system_prompt"] == "Eres Savia."
+    assert "--system-prompt" not in argv
     assert argv[argv.index("--max-turns") + 1] == "1"
     assert "--mcp-config" not in argv  # no tools, no catalog
     # streaming plumbing: started + completed emitted, delta cached in redis
@@ -372,8 +373,16 @@ async def test_empty_reply_after_tool_results_ends_the_turn(tmp_path):
     assert blocks == []
     assert h.io.messages[-1]["content"] == []
     assert [r for r in h.added if isinstance(r, LLMUsage)]
-    argv = h.invocation()["argv"]
-    assert "end the turn with an empty reply" in argv[argv.index("--system-prompt") + 1]
+    assert "end the turn with an empty reply" in h.invocation()["system_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_a_system_prompt_past_one_argv_string_still_reaches_the_cli(tmp_path):
+    # One argv string caps at 32 pages: 128 KiB on a 4 KiB-page kernel.
+    h = _Harness(tmp_path, [[*_text_events("ok"), {"event": _result_event()}]])
+    big = "Regla larga de la revisión. " * 8000
+    await h.complete(system=big)
+    assert h.invocation()["system_prompt"] == big
 
 
 @pytest.mark.asyncio
@@ -564,7 +573,7 @@ async def test_history_turn_appends_protocol_and_strips_leak(tmp_path):
     assert blocks == [{"type": "text", "text": "Hecho."}]
     inv = h.invocation()
     argv = inv["argv"]
-    assert "Conversation history protocol" in argv[argv.index("--system-prompt") + 1]
+    assert "Conversation history protocol" in inv["system_prompt"]
     assert _stdin_text(inv).startswith("<conversation_history>")
 
 
