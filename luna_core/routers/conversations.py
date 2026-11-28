@@ -58,7 +58,11 @@ from luna_core.schemas.conversation import (
     SendMessageRequest,
     SendMessageResponse,
 )
-from luna_core.schemas.tool_approval import ToolApprovalDecision, ToolApprovalRead
+from luna_core.schemas.tool_approval import (
+    ToolApprovalBulkApprove,
+    ToolApprovalDecision,
+    ToolApprovalRead,
+)
 from luna_core.models.event import RunEventType
 from luna_core.services.agent_routing import ROUTING_NODE, handoff_preamble
 from luna_core.services.auto_title import maybe_title_conversation
@@ -78,6 +82,7 @@ from luna_core.services.conversation import (
 from luna_core.services.tool_approval import (
     ToolApprovalNotFound,
     ToolApprovalNotPending,
+    approve_many,
     count_pending,
     decide,
     get_approval,
@@ -594,6 +599,45 @@ async def decide_tool_approval(
             )
 
 
+@router.post(
+    "/{conversation_id}/tool-approvals/approve-all",
+    response_model=SendMessageResponse,
+)
+async def approve_tool_approvals(
+    conversation_id: uuid.UUID,
+    payload: ToolApprovalBulkApprove,
+    request: Request,
+    db: DBSession,
+    redis: RedisClient,
+    user: CurrentUser,
+) -> SendMessageResponse:
+    """Approve several pending calls of the suspended turn in one go. Same as
+    approving each one, but in one statement — a failure can't leave half of
+    them approved — and the turn resumes once. Ids already resolved are skipped; when
+    none of them was still pending, 409 like a double tap on one card."""
+    conversation = await _get_owned(db, conversation_id, user.id)
+    await _admit_turn(request, db, user, conversation)
+    async with conversation_turn(
+        redis, conversation_id, ttl_seconds=settings.chat_turn_lock_seconds, owner_id=user.id
+    ) as acquired:
+        if not acquired:
+            raise _turn_in_progress()
+        with usage_context(user_id=user.id, purpose="chat", scope_id=conversation_id):
+            needs_title = conversation.title is None  # pre-resume snapshot (see send())
+            approved = await approve_many(
+                db, conversation_id, payload.approval_ids, resolved_by=user.id
+            )
+            if not approved:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="approvals already resolved",
+                )
+            return await _wait_or_resume(
+                conversation_id, conversation, approved[0].agent_name, needs_title,
+                request, db, redis, user,
+            )
+
+
 async def _decide_and_resume(
     conversation_id: uuid.UUID,
     conversation: Conversation,
@@ -637,6 +681,23 @@ async def _decide_and_resume(
             resolved_by=user.id,
         )
 
+    return await _wait_or_resume(
+        conversation_id, conversation, approval.agent_name, needs_title, request, db, redis, user
+    )
+
+
+async def _wait_or_resume(
+    conversation_id: uuid.UUID,
+    conversation: Conversation,
+    agent_name: str | None,
+    needs_title: bool,
+    request: Request,
+    db: AsyncSession,
+    redis: Any,
+    user: Any,
+) -> SendMessageResponse:
+    """After a decision: keep the turn parked while any of its calls is still
+    undecided, else resume it (the decided tools run, the LLM continues)."""
     # More approvals of this turn still pending → keep waiting.
     if await count_pending(db, conversation_id) > 0:
         pending = await list_approvals(
@@ -651,7 +712,7 @@ async def _decide_and_resume(
     # All resolved → resume the turn.
     runner = _chat_runner(request)
     agent = await _resuming_agent(
-        _agent_resolver(request), db, conversation, approval.agent_name,
+        _agent_resolver(request), db, conversation, agent_name,
         io=ConversationIO(db, redis, conversation_id),
     )
     # The resumed call gets the same host context a fresh turn gets (date,

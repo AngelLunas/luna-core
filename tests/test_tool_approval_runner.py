@@ -262,3 +262,16 @@ def test_corrected_inputs_go_with_an_approval_only():
     assert ToolApprovalDecision(decision="approved", tool_input={"x": 2}).tool_input == {"x": 2}
     with pytest.raises(ValidationError):
         ToolApprovalDecision(decision="rejected", tool_input={"x": 2})
+
+
+def test_bulk_approve_takes_the_ids_once_and_never_none():
+    from uuid import uuid4
+
+    from pydantic import ValidationError
+
+    from luna_core.schemas.tool_approval import ToolApprovalBulkApprove
+
+    a, b = uuid4(), uuid4()
+    assert ToolApprovalBulkApprove(approval_ids=[a, b, a]).approval_ids == [a, b]
+    with pytest.raises(ValidationError):
+        ToolApprovalBulkApprove(approval_ids=[])

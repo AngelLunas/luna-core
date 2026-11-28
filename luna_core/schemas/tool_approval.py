@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ToolApprovalRead(BaseModel):
@@ -41,4 +41,20 @@ class ToolApprovalDecision(BaseModel):
     def _edited_only_when_approved(self) -> ToolApprovalDecision:
         if self.tool_input is not None and self.decision != "approved":
             raise ValueError("tool_input goes with an approval only")
+        return self
+
+
+class ToolApprovalBulkApprove(BaseModel):
+    """Approve several pending calls of the suspended turn at once.
+
+    The ids are the cards the user was looking at, not "whatever is pending":
+    a call that arrived after they tapped is never approved on their behalf.
+    Kept out of the list by the client (destructive calls, say) stays pending.
+    """
+
+    approval_ids: list[uuid.UUID] = Field(min_length=1, max_length=50)
+
+    @model_validator(mode="after")
+    def _unique(self) -> ToolApprovalBulkApprove:
+        self.approval_ids = list(dict.fromkeys(self.approval_ids))
         return self

@@ -132,6 +132,42 @@ async def decide(
     return await get_approval(db, approval_id)
 
 
+async def approve_many(
+    db: AsyncSession,
+    conversation_id: uuid.UUID,
+    approval_ids: list[uuid.UUID],
+    *,
+    resolved_by: uuid.UUID | None = None,
+) -> list[ToolApproval]:
+    """Approve, in one statement, every listed approval that is still pending
+    in this conversation. One already resolved (a racing tap) or belonging
+    elsewhere is skipped, not an error: the caller gets back only the rows this
+    call resolved, empty when it resolved none."""
+    stmt = (
+        update(ToolApproval)
+        .where(
+            ToolApproval.id.in_(approval_ids),
+            ToolApproval.conversation_id == conversation_id,
+            ToolApproval.status == ToolApprovalStatus.pending.value,
+        )
+        .values(
+            status=ToolApprovalStatus.approved.value,
+            reason=None,
+            resolved_at=datetime.now(timezone.utc),
+            resolved_by=resolved_by,
+        )
+        .returning(ToolApproval.id)
+    )
+    ids = [row[0] for row in (await db.execute(stmt)).all()]
+    await db.commit()
+    if not ids:
+        return []
+    rows = await db.execute(
+        select(ToolApproval).where(ToolApproval.id.in_(ids)).order_by(ToolApproval.created_at)
+    )
+    return list(rows.scalars().all())
+
+
 def should_cascade_rejection(decision: str, reason: str | None) -> bool:
     """Whether resolving this approval should also reject the turn's remaining
     gated calls.
